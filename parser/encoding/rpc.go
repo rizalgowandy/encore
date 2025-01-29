@@ -3,12 +3,12 @@ package encoding
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/cockroachdb/errors"
 	"github.com/golang/protobuf/proto"
-	"golang.org/x/exp/slices"
 
 	"encr.dev/pkg/idents"
 	meta "encr.dev/proto/encore/parser/meta/v1"
@@ -23,6 +23,7 @@ const (
 	Header    ParameterLocation = "header"    // Parameter is placed in the HTTP header
 	Query     ParameterLocation = "query"     // Parameter is placed in the query string
 	Body      ParameterLocation = "body"      // Parameter is placed in the body
+	Cookie    ParameterLocation = "cookie"    // Parameter is placed in cookies
 )
 
 var (
@@ -34,12 +35,17 @@ var (
 	HeaderTag = tagDescription{
 		location:        Header,
 		overrideDefault: true,
-		nameFormatter:   strings.ToLower,
+		wireFormatter:   strings.ToLower,
 	}
 	JSONTag = tagDescription{
 		location:        Body,
 		omitEmptyOption: "omitempty",
 		overrideDefault: false,
+	}
+	CookieTag = tagDescription{
+		location:        Cookie,
+		omitEmptyOption: "omitempty",
+		overrideDefault: true,
 	}
 )
 
@@ -47,6 +53,7 @@ var (
 var authTags = map[string]tagDescription{
 	"query":  QueryTag,
 	"header": HeaderTag,
+	"cookie": CookieTag,
 }
 
 // requestTags is a description of tags used for requests
@@ -71,7 +78,7 @@ type tagDescription struct {
 	location        ParameterLocation
 	overrideDefault bool
 	omitEmptyOption string
-	nameFormatter   func(string) string
+	wireFormatter   func(name string) string
 }
 
 // encodingHints is used to determine the default location and applicable tag overrides for http
@@ -127,25 +134,38 @@ type AuthEncoding struct {
 	LegacyTokenFormat bool
 
 	// Contains metadata about how to marshal an HTTP parameter
-	QueryParameters  []*ParameterEncoding `json:"query_parameters"`
 	HeaderParameters []*ParameterEncoding `json:"header_parameters"`
+	QueryParameters  []*ParameterEncoding `json:"query_parameters"`
+	CookieParameters []*ParameterEncoding `json:"cookie_parameters"`
 }
 
 // ParameterEncodingMap returns the parameter encodings as a map, keyed by SrcName.
 func (e *AuthEncoding) ParameterEncodingMap() map[string]*ParameterEncoding {
-	return toEncodingMap(e.QueryParameters, e.HeaderParameters)
+	return toEncodingMap(srcNameKey, e.HeaderParameters, e.QueryParameters, e.CookieParameters)
+}
+
+// ParameterEncodingMapByName returns the parameter encodings as a map, keyed by Name.
+// Conflicts result in an undefined encoding getting set.
+func (e *AuthEncoding) ParameterEncodingMapByName() map[string][]*ParameterEncoding {
+	return toEncodingMultiMap(nameKey, e.HeaderParameters, e.QueryParameters, e.CookieParameters)
 }
 
 // ResponseEncoding expresses how a response should be encoded on the wire
 type ResponseEncoding struct {
 	// Contains metadata about how to marshal an HTTP parameter
-	BodyParameters   []*ParameterEncoding `json:"body_parameters"`
 	HeaderParameters []*ParameterEncoding `json:"header_parameters"`
+	BodyParameters   []*ParameterEncoding `json:"body_parameters"`
 }
 
 // ParameterEncodingMap returns the parameter encodings as a map, keyed by SrcName.
 func (e *ResponseEncoding) ParameterEncodingMap() map[string]*ParameterEncoding {
-	return toEncodingMap(e.BodyParameters, e.HeaderParameters)
+	return toEncodingMap(srcNameKey, e.HeaderParameters, e.BodyParameters)
+}
+
+// ParameterEncodingMapByName returns the parameter encodings as a map, keyed by Name.
+// Conflicts result in an undefined encoding getting set.
+func (e *ResponseEncoding) ParameterEncodingMapByName() map[string][]*ParameterEncoding {
+	return toEncodingMultiMap(nameKey, e.HeaderParameters, e.BodyParameters)
 }
 
 // RequestEncoding expresses how a request should be encoded for an explicit set of HTTPMethods
@@ -153,14 +173,20 @@ type RequestEncoding struct {
 	// The HTTP methods these field configurations can be used for
 	HTTPMethods []string `json:"http_methods"`
 	// Contains metadata about how to marshal an HTTP parameter
-	BodyParameters   []*ParameterEncoding `json:"body_parameters"`
 	HeaderParameters []*ParameterEncoding `json:"header_parameters"`
 	QueryParameters  []*ParameterEncoding `json:"query_parameters"`
+	BodyParameters   []*ParameterEncoding `json:"body_parameters"`
 }
 
 // ParameterEncodingMap returns the parameter encodings as a map, keyed by SrcName.
 func (e *RequestEncoding) ParameterEncodingMap() map[string]*ParameterEncoding {
-	return toEncodingMap(e.BodyParameters, e.HeaderParameters, e.QueryParameters)
+	return toEncodingMap(srcNameKey, e.HeaderParameters, e.QueryParameters, e.BodyParameters)
+}
+
+// ParameterEncodingMapByName returns the parameter encodings as a map, keyed by Name.
+// Conflicts result in an undefined encoding getting set.
+func (e *RequestEncoding) ParameterEncodingMapByName() map[string][]*ParameterEncoding {
+	return toEncodingMultiMap(nameKey, e.HeaderParameters, e.QueryParameters, e.BodyParameters)
 }
 
 // ParameterEncoding expresses how a parameter should be encoded on the wire
@@ -179,6 +205,10 @@ type ParameterEncoding struct {
 	Type *schema.Type `json:"type"`
 	// RawTag specifies the raw, unparsed struct tag for the field.
 	RawTag string `json:"raw_tag"`
+	// WireFormat is the wire format of the parameter.
+	WireFormat string `json:"wire_format"`
+	// Optional indicates whether the field is optional.
+	Optional bool `json:"optional"`
 }
 
 type Options struct {
@@ -215,7 +245,7 @@ func DescribeAPI(meta *meta.Data) *APIEncoding {
 	var err error
 	api.Authorization, err = DescribeAuth(meta, meta.AuthHandler.Params, nil)
 	if err != nil {
-		panic(fmt.Sprintf("Invalid auth definition: %s", meta.AuthHandler.Name))
+		panic(fmt.Sprintf("Invalid auth definition: %s: %v", meta.AuthHandler.Name, err))
 	}
 	return api
 }
@@ -234,7 +264,7 @@ func DescribeService(meta *meta.Data, svc *meta.Service) *ServiceEncoding {
 	for i, r := range svc.Rpcs {
 		rpc, err := DescribeRPC(meta, r, nil)
 		if err != nil {
-			panic("invalid rpc")
+			panic(fmt.Sprintf("invalid rpc: %v", err))
 		}
 		service.RPCs[i] = rpc
 	}
@@ -249,7 +279,7 @@ func DescribeRPC(appMetaData *meta.Data, rpc *meta.RPC, options *Options) (*RPCE
 		AccessType:    rpc.AccessType.String(),
 		Proto:         rpc.Proto.String(),
 		Path:          rpc.Path,
-		Doc:           findDoc(rpc.Doc, appMetaData),
+		Doc:           rpc.GetDoc(),
 	}
 	var err error
 	// Work out the request encoding
@@ -278,22 +308,48 @@ func DescribeRPC(appMetaData *meta.Data, rpc *meta.RPC, options *Options) (*RPCE
 	return encoding, nil
 }
 
-// getConcreteStructType returns a construct Struct object for the given schema. This means any generic types
+// GetConcreteStructType returns a construct Struct object for the given schema. This means any generic types
 // in the struct will be resolved to their concrete types and there will be no generic parameters in the struct object.
 // However, any nested structs may still contain generic types.
 //
 // If a nil schema is provided, a nil struct is returned.
-func getConcreteStructType(appMetaData *meta.Data, typ *schema.Type, typeArgs []*schema.Type) (*schema.Struct, error) {
-	if typ == nil {
+func GetConcreteStructType(appDecls []*schema.Decl, typ *schema.Type, typeArgs []*schema.Type) (*schema.Struct, error) {
+	// dereference pointers
+	pointer := typ.GetPointer()
+	for pointer != nil {
+		typ = pointer.Base
+		pointer = typ.GetPointer()
+	}
+
+	typ, err := GetConcreteType(appDecls, typ, typeArgs)
+	if err != nil {
+		return nil, err
+	}
+
+	struc := typ.GetStruct()
+	if struc == nil {
+		return nil, errors.Newf("unsupported type %+v", reflect.TypeOf(typ.Typ))
+	}
+
+	return struc, nil
+}
+
+// GetConcreteType returns a concrete type for the given schema. This means any generic types
+// in the top level type will be resolved to their concrete types and there will be no generic parameters in returned typ.
+// However, any nested types may still contain generic types.
+//
+// If a nil schema is provided, a nil is returned.
+func GetConcreteType(appDecls []*schema.Decl, originalType *schema.Type, typeArgs []*schema.Type) (*schema.Type, error) {
+	if originalType == nil {
 		// If there's no schema type, we want to shortcut
 		return nil, nil
 	}
 
-	switch typ := typ.Typ.(type) {
+	switch typ := originalType.Typ.(type) {
 	case *schema.Type_Struct:
 		// If there are no type arguments, we've got a concrete type
 		if len(typeArgs) == 0 {
-			return typ.Struct, nil
+			return originalType, nil
 		}
 
 		// Deep copy the original struct
@@ -307,10 +363,99 @@ func getConcreteStructType(appMetaData *meta.Data, typ *schema.Type, typeArgs []
 			field.Typ = resolveTypeParams(field.Typ, typeArgs)
 		}
 
-		return struc, nil
+		return &schema.Type{Typ: &schema.Type_Struct{Struct: struc}}, nil
+
+	case *schema.Type_Map:
+		// If there are no type arguments, we've got a concrete type
+		if len(typeArgs) == 0 {
+			return originalType, nil
+		}
+
+		// Deep copy the original struct
+		mapType, ok := proto.Clone(typ.Map).(*schema.Map)
+		if !ok {
+			return nil, errors.New("failed to clone map")
+		}
+
+		return resolveTypeParams(&schema.Type{Typ: &schema.Type_Map{Map: mapType}}, typeArgs), nil
+
+	case *schema.Type_Union:
+		// If there are no type arguments, we've got a concrete type
+		if len(typeArgs) == 0 {
+			return originalType, nil
+		}
+
+		types := make([]*schema.Type, len(typ.Union.Types))
+		for i, t := range typ.Union.Types {
+			// Deep copy the type
+			cloned := proto.Clone(t).(*schema.Type)
+			types[i] = resolveTypeParams(cloned, typeArgs)
+		}
+
+		return &schema.Type{Typ: &schema.Type_Union{
+			Union: &schema.Union{
+				Types: types,
+			},
+		}}, nil
+
+	case *schema.Type_List:
+		// If there are no type arguments, we've got a concrete type
+		if len(typeArgs) == 0 {
+			return originalType, nil
+		}
+
+		// Deep copy the original struct
+		list, ok := proto.Clone(typ.List).(*schema.List)
+		if !ok {
+			return nil, errors.New("failed to clone list type")
+		}
+
+		// replace any type parameters with the type argument
+		return resolveTypeParams(&schema.Type{Typ: &schema.Type_List{List: list}}, typeArgs), nil
+
+	case *schema.Type_Pointer:
+		// If there are no type arguments, we've got a concrete type
+		if len(typeArgs) == 0 {
+			return originalType, nil
+		}
+
+		// Deep copy the original struct
+		pointer, ok := proto.Clone(typ.Pointer).(*schema.Pointer)
+		if !ok {
+			return nil, errors.New("failed to clone pointer type")
+		}
+
+		var err error
+		pointer.Base, err = GetConcreteType(appDecls, pointer.Base, typeArgs)
+		if err != nil {
+			return nil, err
+		}
+
+		// replace any type parameters with the type argument
+		return resolveTypeParams(&schema.Type{Typ: &schema.Type_Pointer{Pointer: pointer}}, typeArgs), nil
+
+	case *schema.Type_Config:
+		// If there are no type arguments, we've got a concrete type
+		if len(typeArgs) == 0 {
+			return originalType, nil
+		}
+
+		// Deep copy the original struct
+		config, ok := proto.Clone(typ.Config).(*schema.ConfigValue)
+		if !ok {
+			return nil, errors.New("failed to clone config type")
+		}
+
+		// replace any type parameters with the type argument
+		return resolveTypeParams(&schema.Type{Typ: &schema.Type_Config{Config: config}}, typeArgs), nil
+
 	case *schema.Type_Named:
-		decl := appMetaData.Decls[typ.Named.Id]
-		return getConcreteStructType(appMetaData, decl.Type, typ.Named.TypeArguments)
+		decl := appDecls[typ.Named.Id]
+		return GetConcreteType(appDecls, decl.Type, typ.Named.TypeArguments)
+
+	case *schema.Type_Builtin:
+		return originalType, nil
+
 	default:
 		return nil, errors.Newf("unsupported type %+v", reflect.TypeOf(typ))
 	}
@@ -323,12 +468,23 @@ func resolveTypeParams(typ *schema.Type, typeArgs []*schema.Type) *schema.Type {
 	case *schema.Type_TypeParameter:
 		return typeArgs[t.TypeParameter.ParamIdx]
 
+	case *schema.Type_Struct:
+		for _, field := range t.Struct.Fields {
+			field.Typ = resolveTypeParams(field.Typ, typeArgs)
+		}
+
 	case *schema.Type_List:
 		t.List.Elem = resolveTypeParams(t.List.Elem, typeArgs)
 
 	case *schema.Type_Map:
 		t.Map.Key = resolveTypeParams(t.Map.Key, typeArgs)
 		t.Map.Value = resolveTypeParams(t.Map.Value, typeArgs)
+
+	case *schema.Type_Config:
+		t.Config.Elem = resolveTypeParams(t.Config.Elem, typeArgs)
+
+	case *schema.Type_Pointer:
+		t.Pointer.Base = resolveTypeParams(t.Pointer.Base, typeArgs)
 
 	case *schema.Type_Named:
 		for i, param := range t.Named.TypeArguments {
@@ -372,24 +528,26 @@ func DescribeAuth(appMetaData *meta.Data, authSchema *schema.Type, options *Opti
 		}
 		return &AuthEncoding{LegacyTokenFormat: true}, nil
 	case *schema.Type_Named:
+	case *schema.Type_Pointer:
 	default:
 		return nil, errors.Newf("unsupported auth parameter type %T", errors.Safe(t))
 	}
 
-	authStruct, err := getConcreteStructType(appMetaData, authSchema, nil)
+	authStruct, err := GetConcreteStructType(appMetaData.Decls, authSchema, nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "auth struct")
 	}
-	fields, err := describeParams(&encodingHints{Undefined, authTags, options}, authStruct)
+	fields, err := describeParams(appMetaData.Language, &encodingHints{Undefined, authTags, options}, authStruct)
 	if err != nil {
 		return nil, err
 	}
-	if locationDiff := keyDiff(fields, Header, Query); len(locationDiff) > 0 {
-		return nil, errors.Newf("auth must only contain query and header parameters. Found: %v", locationDiff)
+	if locationDiff := keyDiff(fields, Header, Query, Cookie); len(locationDiff) > 0 {
+		return nil, errors.Newf("auth must only contain query, header, and cookie parameters. Found: %v", locationDiff)
 	}
 	return &AuthEncoding{
 		QueryParameters:  fields[Query],
 		HeaderParameters: fields[Header],
+		CookieParameters: fields[Cookie],
 	}, nil
 }
 
@@ -399,11 +557,11 @@ func DescribeResponse(appMetaData *meta.Data, responseSchema *schema.Type, optio
 	if responseSchema == nil {
 		return nil, nil
 	}
-	responseStruct, err := getConcreteStructType(appMetaData, responseSchema, nil)
+	responseStruct, err := GetConcreteStructType(appMetaData.Decls, responseSchema, nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "response struct")
 	}
-	fields, err := describeParams(&encodingHints{Body, responseTags, options}, responseStruct)
+	fields, err := describeParams(appMetaData.Language, &encodingHints{Body, responseTags, options}, responseStruct)
 	if err != nil {
 		return nil, err
 	}
@@ -418,7 +576,7 @@ func DescribeResponse(appMetaData *meta.Data, responseSchema *schema.Type, optio
 
 // keyDiff returns the diff between src.keys and keys
 func keyDiff[T comparable, V any](src map[T]V, keys ...T) (diff []T) {
-	for k, _ := range src {
+	for k := range src {
 		if !slices.Contains(keys, k) {
 			diff = append(diff, k)
 		}
@@ -445,7 +603,7 @@ func DescribeRequest(appMetaData *meta.Data, requestSchema *schema.Type, options
 	var requestStruct *schema.Struct
 	var err error
 	if requestSchema != nil {
-		requestStruct, err = getConcreteStructType(appMetaData, requestSchema, nil)
+		requestStruct, err = GetConcreteStructType(appMetaData.Decls, requestSchema, nil)
 		if err != nil {
 			return nil, errors.Wrap(err, "request struct")
 		}
@@ -456,7 +614,7 @@ func DescribeRequest(appMetaData *meta.Data, requestSchema *schema.Type, options
 		var fields map[ParameterLocation][]*ParameterEncoding
 
 		if requestStruct != nil {
-			fields, err = describeParams(&encodingHints{location, requestTags, options}, requestStruct)
+			fields, err = describeParams(appMetaData.Language, &encodingHints{location, requestTags, options}, requestStruct)
 			if err != nil {
 				return nil, err
 			}
@@ -481,10 +639,10 @@ func DescribeRequest(appMetaData *meta.Data, requestSchema *schema.Type, options
 }
 
 // describeParams calls describeParam() for each field in the payload struct
-func describeParams(encodingHints *encodingHints, payload *schema.Struct) (fields map[ParameterLocation][]*ParameterEncoding, err error) {
+func describeParams(lang meta.Lang, encodingHints *encodingHints, payload *schema.Struct) (fields map[ParameterLocation][]*ParameterEncoding, err error) {
 	paramByLocation := make(map[ParameterLocation][]*ParameterEncoding)
 	for _, f := range payload.GetFields() {
-		f, err := describeParam(encodingHints, f)
+		f, err := describeParam(lang, encodingHints, f)
 		if err != nil {
 			return nil, err
 		}
@@ -497,13 +655,12 @@ func describeParams(encodingHints *encodingHints, payload *schema.Struct) (field
 }
 
 // formatName formats a parameter name with the default formatting for the location (e.g. snakecase for query)
-func formatName(location ParameterLocation, name string) string {
-	switch location {
-	case Query:
+func formatName(lang meta.Lang, location ParameterLocation, name string) string {
+	if location == Query && lang == meta.Lang_GO {
 		return idents.Convert(name, idents.SnakeCase)
-	default:
-		return name
 	}
+
+	return name
 }
 
 // IgnoreField returns true if the field name is "-" is any of the valid request or response tags
@@ -520,15 +677,18 @@ func IgnoreField(field *schema.Field) bool {
 // (e.g. qs, query, header) should be encoded in HTTP (name and location).
 //
 // It returns nil, nil if the field is not to be encoded.
-func describeParam(encodingHints *encodingHints, field *schema.Field) (*ParameterEncoding, error) {
+func describeParam(lang meta.Lang, encodingHints *encodingHints, field *schema.Field) (*ParameterEncoding, error) {
 	location := encodingHints.defaultLocation
+	name := formatName(lang, encodingHints.defaultLocation, field.Name)
 	param := ParameterEncoding{
-		Name:      formatName(encodingHints.defaultLocation, field.Name),
-		OmitEmpty: false,
-		SrcName:   field.Name,
-		Doc:       field.Doc,
-		Type:      field.Typ,
-		RawTag:    field.RawTag,
+		Name:       name,
+		OmitEmpty:  false,
+		SrcName:    field.Name,
+		Doc:        field.Doc,
+		Type:       field.Typ,
+		RawTag:     field.RawTag,
+		Optional:   field.Optional,
+		WireFormat: name,
 	}
 
 	var usedOverrideTag string
@@ -550,10 +710,11 @@ func describeParam(encodingHints *encodingHints, field *schema.Field) (*Paramete
 			usedOverrideTag = tag.Key
 		}
 		if tagHint.location == location {
-			if tagHint.nameFormatter != nil {
-				param.Name = tagHint.nameFormatter(tag.Name)
+			param.Name = tag.Name
+			if tagHint.wireFormatter != nil {
+				param.WireFormat = tagHint.wireFormatter(tag.Name)
 			} else {
-				param.Name = tag.Name
+				param.WireFormat = tag.Name
 			}
 		}
 		if tagHint.omitEmptyOption != "" {
@@ -577,12 +738,33 @@ func describeParam(encodingHints *encodingHints, field *schema.Field) (*Paramete
 }
 
 // toEncodingMap returns a map from SrcName to parameter encodings.
-func toEncodingMap(encodings ...[]*ParameterEncoding) map[string]*ParameterEncoding {
+func toEncodingMap(keyFunc func(e *ParameterEncoding) string, encodings ...[]*ParameterEncoding) map[string]*ParameterEncoding {
 	res := make(map[string]*ParameterEncoding)
 	for _, e := range encodings {
 		for _, param := range e {
-			res[param.SrcName] = param
+			res[keyFunc(param)] = param
 		}
 	}
 	return res
+}
+
+// toEncodingMultiMap returns a map from a key to the list of parameter encodings
+// matching that key.
+func toEncodingMultiMap(keyFunc func(e *ParameterEncoding) string, encodings ...[]*ParameterEncoding) map[string][]*ParameterEncoding {
+	res := make(map[string][]*ParameterEncoding)
+	for _, e := range encodings {
+		for _, param := range e {
+			key := keyFunc(param)
+			res[key] = append(res[key], param)
+		}
+	}
+	return res
+}
+
+func srcNameKey(e *ParameterEncoding) string {
+	return e.SrcName
+}
+
+func nameKey(e *ParameterEncoding) string {
+	return e.Name
 }

@@ -33,7 +33,7 @@ var (
 	ErrServerOverloaded = NewError(-32000, "JSON RPC overloaded")
 )
 
-// wireRequest is sent to a server to represent a Call or Notify operaton.
+// wireRequest is sent to a server to represent a Call or Notify operation.
 type wireRequest struct {
 	// VersionTag is always encoded as the string "2.0"
 	VersionTag wireVersionTag `json:"jsonrpc"`
@@ -137,9 +137,9 @@ func (id ID) Format(f fmt.State, r rune) {
 	}
 	switch {
 	case id.name != "":
-		fmt.Fprintf(f, strF, id.name)
+		_, _ = fmt.Fprintf(f, strF, id.name)
 	default:
-		fmt.Fprintf(f, numF, id.number)
+		_, _ = fmt.Fprintf(f, numF, id.number)
 	}
 }
 

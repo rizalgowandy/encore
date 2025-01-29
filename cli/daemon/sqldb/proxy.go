@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgproto3/v2"
 	"github.com/rs/zerolog/log"
 
+	"encr.dev/cli/daemon/namespace"
+	"encr.dev/pkg/fns"
 	"encr.dev/pkg/pgproxy"
 )
 
@@ -49,7 +52,7 @@ func (cm *ClusterManager) ServeProxy(ln net.Listener) error {
 // If waitForSetup is true, it will wait for initial setup to complete
 // before proxying the connection.
 func (cm *ClusterManager) ProxyConn(client net.Conn, waitForSetup bool) error {
-	defer client.Close()
+	defer fns.CloseIgnore(client)
 	cl, err := pgproxy.SetupClient(client, &pgproxy.ClientConfig{
 		TLS:          nil,
 		WantPassword: true,
@@ -64,58 +67,135 @@ func (cm *ClusterManager) ProxyConn(client net.Conn, waitForSetup bool) error {
 	}
 	startup := cl.Hello.(*pgproxy.StartupData)
 
-	password := startup.Password
-	cluster, ok := cm.LookupPassword(password)
-	if !ok {
-		cm.log.Error().Interface("cluster", cluster.ID).Msg("dbproxy: could not find cluster")
-		_ = cl.Backend.Send(&pgproto3.ErrorResponse{
-			Severity: "FATAL",
-			Code:     "08006",
-			Message:  "database cluster not running",
+	// If the username is "encore" we're connecting to a database cluster
+	// which may not be local
+	var cluster *Cluster
+	if startup.Username == "encore" {
+		password := startup.Password
+		found, ok := cm.LookupPassword(password)
+		if !ok {
+			cm.log.Error().Msg("dbproxy: could not find cluster")
+			_ = cl.Backend.Send(&pgproto3.ErrorResponse{
+				Severity: "FATAL",
+				Code:     "08006",
+				Message:  "database cluster not found or invalid connection string",
+			})
+			return nil
+		}
+		cluster = found
+	} else {
+		// The username is the app slug we want to connect to
+		app, err := cm.apps.FindLatestByPlatformOrLocalID(startup.Username)
+		if err != nil {
+			cm.log.Error().Err(err).Msg("dbproxy: could not find app")
+			_ = cl.Backend.Send(&pgproto3.ErrorResponse{
+				Severity: "FATAL",
+				Code:     "08006",
+				Message:  "unknown app ID",
+			})
+			return nil
+		}
+
+		ctx := context.Background()
+
+		clusterType, nsID, ok := strings.Cut(startup.Password, "-")
+
+		// Look up the namespace to use.
+		var ns *namespace.Namespace
+		if !ok {
+			ns, err = cm.ns.GetActive(ctx, app)
+		} else {
+			ns, err = cm.ns.GetByID(ctx, app, namespace.ID(nsID))
+		}
+		if err != nil {
+			cm.log.Error().Err(err).Msg("dbproxy: could not find infra namespace")
+			_ = cl.Backend.Send(&pgproto3.ErrorResponse{
+				Severity: "FATAL",
+				Code:     "08006",
+				Message:  "unknown active infra namespace",
+			})
+			return nil
+		}
+
+		// Resolve the cluster type.
+		var ct ClusterType
+		switch clusterType {
+		case "local":
+			ct = Run
+		case "test":
+			ct = Test
+		case "shadow":
+			ct = Shadow
+		default:
+			cm.log.Error().Str("password", startup.Password).Msg("dbproxy: invalid password for connection URI")
+			_ = cl.Backend.Send(&pgproto3.ErrorResponse{
+				Severity: "FATAL",
+				Code:     "28P01", // 28P01 = invalid password
+				Message:  "if connecting with an app slug as the username, the only accepted passwords are 'local' or 'test' to route to those instances on your local system",
+			})
+			return nil
+		}
+
+		// Create the cluster if it doesn't exist in memory yet
+		// This might be because the daemon is running, but the hasn't done anything
+		// with the app in question yet on this run
+		cluster = cm.Create(context.Background(), &CreateParams{
+			ClusterID: GetClusterID(app, ct, ns),
+			Memfs:     ct.Memfs(),
 		})
-		return nil
+
+		// Ensure the cluster is started
+		_, err = cluster.Start(context.Background(), nil)
+		if err != nil {
+			cm.log.Error().Err(err).Msg("dbproxy: could not start cluster")
+			_ = cl.Backend.Send(&pgproto3.ErrorResponse{
+				Severity: "FATAL",
+				Code:     "08006",
+				Message:  "could not start database cluster",
+			})
+			return nil
+		}
 	}
 
+	// If Encore knows about the database, check if it's ready
+	// however if the cluster doesn't know about the database, skip this part.
+	//
+	// This is because either:
+	//   1. The database exists and is connected to
+	//   2. The database does not exist, and the remote server will return a "database doesn't exist" error.
 	dbname := startup.Database
 	db, ok := cluster.GetDB(dbname)
-	if !ok {
-		_ = cl.Backend.Send(&pgproto3.ErrorResponse{
-			Severity: "FATAL",
-			Code:     "08006",
-			Message:  "database not found",
-		})
-		return nil
-	}
+	if ok {
+		var ready <-chan struct{}
+		if waitForSetup {
+			ready = db.Ready()
+		} else {
+			s := make(chan struct{})
+			close(s)
+			ready = s
+		}
 
-	var ready <-chan struct{}
-	if waitForSetup {
-		ready = db.Ready()
-	} else {
-		s := make(chan struct{})
-		close(s)
-		ready = s
-	}
+		// Wait for up to 60s for the cluster and database to come online.
+		select {
+		case <-db.Ctx.Done():
+			_ = cl.Backend.Send(&pgproto3.ErrorResponse{
+				Severity: "FATAL",
+				Code:     "08006",
+				Message:  "db is shutting down",
+			})
+			return nil
+		case <-time.After(60 * time.Second):
+			cm.log.Error().Str("db", db.ApplicationCloudName()).Msg("dbproxy: timed out waiting for database to come online")
+			_ = cl.Backend.Send(&pgproto3.ErrorResponse{
+				Severity: "FATAL",
+				Code:     "08006",
+				Message:  "timed out waiting for db to complete setup",
+			})
+			return nil
 
-	// Wait for up to 60s for the cluster and database to come online.
-	select {
-	case <-db.Ctx.Done():
-		_ = cl.Backend.Send(&pgproto3.ErrorResponse{
-			Severity: "FATAL",
-			Code:     "08006",
-			Message:  "db is shutting down",
-		})
-		return nil
-	case <-time.After(60 * time.Second):
-		cm.log.Error().Str("db", dbname).Msg("dbproxy: timed out waiting for database to come online")
-		_ = cl.Backend.Send(&pgproto3.ErrorResponse{
-			Severity: "FATAL",
-			Code:     "08006",
-			Message:  "timed out waiting for db to complete setup",
-		})
-		return nil
-
-	case <-ready:
-		// Continue connecting to backend, below
+		case <-ready:
+			// Continue connecting to backend, below
+		}
 	}
 
 	info, err := cluster.Info(context.Background())
@@ -137,12 +217,21 @@ func (cm *ClusterManager) ProxyConn(client net.Conn, waitForSetup bool) error {
 		})
 		return nil
 	}
-	defer server.Close()
+	defer fns.CloseIgnore(server)
 
 	// Send a modified startup message to the backend
 	admin, _ := info.Encore.First(RoleAdmin, RoleSuperuser)
 	startup.Username = admin.Username
 	startup.Password = admin.Password
+	if db == nil {
+		// We don't know about this database, we'll use the requested name
+		// in case it does actually exist within the cluster.
+		//
+		// If it doesn't the cluster will return an SQL error to the client.
+		startup.Database = dbname
+	} else {
+		startup.Database = db.ApplicationCloudName()
+	}
 	fe, err := pgproxy.SetupServer(server, &pgproxy.ServerConfig{
 		TLS:     nil,
 		Startup: startup,
@@ -189,9 +278,9 @@ func (cm *ClusterManager) ProxyConn(client net.Conn, waitForSetup bool) error {
 
 // PreauthProxyConn is a pre-authenticated proxy conn directly specifically to the given cluster.
 func (cm *ClusterManager) PreauthProxyConn(client net.Conn, id ClusterID) error {
-	defer client.Close()
+	defer fns.CloseIgnore(client)
 	cl, err := pgproxy.SetupClient(client, &pgproxy.ClientConfig{
-		TLS: &tls.Config{},
+		TLS: &tls.Config{MinVersion: tls.VersionTLS12},
 	})
 	if err != nil {
 		log.Error().Err(err).Msg("failed to setup client")
@@ -266,11 +355,12 @@ func (cm *ClusterManager) PreauthProxyConn(client net.Conn, id ClusterID) error 
 		})
 		return nil
 	}
-	defer server.Close()
+	defer fns.CloseIgnore(server)
 
 	admin, _ := info.Encore.First(RoleAdmin, RoleSuperuser)
 	startup.Username = admin.Username
 	startup.Password = admin.Password
+	startup.Database = db.ApplicationCloudName()
 	fe, err := pgproxy.SetupServer(server, &pgproxy.ServerConfig{
 		TLS:     nil,
 		Startup: startup,
@@ -330,7 +420,7 @@ func (cm *ClusterManager) cancelRequest(client io.Writer, req *pgproxy.CancelDat
 			Code:     "08006",
 			Message:  "database cluster not running",
 		}
-		client.Write(msg.Encode(nil))
+		_, _ = client.Write(msg.Encode(nil))
 		return
 	}
 
@@ -341,10 +431,10 @@ func (cm *ClusterManager) cancelRequest(client io.Writer, req *pgproxy.CancelDat
 			Code:     "08006",
 			Message:  "database cluster not running",
 		}
-		client.Write(msg.Encode(nil))
+		_, _ = client.Write(msg.Encode(nil))
 		return
 	}
-	defer backend.Close()
+	defer fns.CloseIgnore(backend)
 	_ = pgproxy.SendCancelRequest(backend, req.Raw)
 }
 

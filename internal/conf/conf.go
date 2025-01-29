@@ -1,0 +1,287 @@
+// Package conf writes and reads the Encore configuration file for the user.
+package conf
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+
+	"golang.org/x/oauth2"
+
+	"encr.dev/internal/goldfish"
+	"encr.dev/pkg/xos"
+)
+
+var ErrInvalidRefreshToken = errors.New("invalid refresh token")
+var ErrNotLoggedIn = errors.New("not logged in: run 'encore auth login' first")
+
+// These can be overwritten using
+// `go build -ldflags "-X encr.dev/cli/internal/conf.defaultPlatformURL=https://api.encore.dev"`.
+var (
+	defaultPlatformURL     = "https://api.encore.cloud"
+	defaultDevDashURL      = "https://devdash.encore.dev"
+	defaultConfigDirectory = "encore"
+)
+
+// APIBaseURL is the base URL for communicating with the Encore Platform.
+var APIBaseURL = (func() string {
+	if u := os.Getenv("ENCORE_PLATFORM_API_URL"); u != "" {
+		return u
+	}
+	return defaultPlatformURL
+})()
+
+// WSBaseURL is the base URL for communicating with the Encore Platform over WebSocket.
+var WSBaseURL = (func() string {
+	return strings.Replace(APIBaseURL, "http", "ws", -1) // "https" becomes "wss"
+})()
+
+// DevDashURL is the base URL to retrieve the dev dashboard code from.
+var DevDashURL = (func() string {
+	if u := os.Getenv("ENCORE_DEVDASH_URL"); u != "" {
+		return u
+	}
+	return defaultDevDashURL
+})()
+
+// CacheDevDash reports whether or not the dev dash contents should be cached.
+var CacheDevDash = (func() bool {
+	return !strings.Contains(DevDashURL, "localhost")
+})()
+
+// DevDaemon reports whether or not the daemon is running in development mode.
+var DevDaemon = (func() bool {
+	return os.Getenv("ENCORE_DAEMON_DEV") != ""
+})()
+
+// Dir reports the directory where Encore's configuration is stored.
+func Dir() (string, error) {
+	dir := os.Getenv("ENCORE_CONFIG_DIR")
+	if dir == "" {
+		d, err := os.UserConfigDir()
+		if err != nil {
+			return "", err
+		}
+		dir = filepath.Join(d, defaultConfigDirectory)
+	}
+	return dir, nil
+}
+
+// CacheDir reports the base directory for storing data which can be cached
+// and deleted at any time by the user without affecting the Encore daemon.
+//
+// The directory may or may not exist already.
+func CacheDir() (string, error) {
+	dir := os.Getenv("ENCORE_CACHE_DIR")
+	if dir == "" {
+		d, err := os.UserCacheDir()
+		if err != nil {
+			return "", err
+		}
+		dir = filepath.Join(d, defaultConfigDirectory, "cache")
+	}
+	if !filepath.IsAbs(dir) {
+		return "", fmt.Errorf("ENCORE_CACHE_DIR must be absolute, got %q", dir)
+	}
+
+	return dir, nil
+}
+
+// DataDir reports the base directory for storing data, like database volumes.
+// The directory may or may not exist already.
+func DataDir() (string, error) {
+	dir := os.Getenv("ENCORE_DATA_DIR")
+	if dir == "" {
+		d, err := os.UserCacheDir()
+		if err != nil {
+			return "", err
+		}
+		dir = filepath.Join(d, defaultConfigDirectory, "data")
+	}
+	if !filepath.IsAbs(dir) {
+		return "", fmt.Errorf("ENCORE_DATA_DIR must be absolute, got %q", dir)
+	}
+	return dir, nil
+}
+
+// Config represents the stored Encore configuration.
+type Config struct {
+	oauth2.Token
+	Actor     string `json:"actor,omitempty"`    // The ID of either the user or app authenticated
+	Email     string `json:"email,omitempty"`    // non-zero if logged in as a user
+	AppSlug   string `json:"app_slug,omitempty"` // non-zero if logged in as an app
+	WireGuard struct {
+		PublicKey  string `json:"pub,omitempty"`
+		PrivateKey string `json:"priv,omitempty"`
+	} `json:"wg,omitempty"`
+}
+
+// Write persists the configuration for the user.
+func Write(cfg *Config) (err error) {
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("conf.Write: %v", err)
+		}
+	}()
+
+	dir, err := Dir()
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, ".auth_token")
+	if data, err := json.Marshal(cfg); err != nil {
+		return err
+	} else if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	} else if err := xos.WriteFile(path, data, 0600); err != nil {
+		return err
+	}
+	return nil
+}
+
+func Logout() error {
+	dir, err := Dir()
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, ".auth_token")
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	DefaultTokenSource = NewTokenSource()
+	AuthClient = oauth2.NewClient(nil, DefaultTokenSource)
+	return nil
+}
+
+func CurrentUser() (*Config, error) {
+	dir, err := Dir()
+	if err != nil {
+		return nil, fmt.Errorf("conf.CurrentUser: %w", err)
+	}
+	conf, err := readConf(dir)
+	if err != nil {
+		return nil, fmt.Errorf("conf.CurrentUser: %w", err)
+	}
+	return conf, nil
+}
+
+func OriginalUser(configDir string) (cfg *Config, err error) {
+	if runtime.GOOS == "windows" {
+		// Windows does not have the notion of a root user, so just use CurrentUser
+		return CurrentUser()
+	}
+
+	if configDir == "" {
+		var err error
+		configDir, err = Dir()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return readConf(configDir)
+}
+
+func readConf(configDir string) (*Config, error) {
+	path := filepath.Join(configDir, ".auth_token")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var conf Config
+	if err := json.Unmarshal(data, &conf); err != nil {
+		return nil, err
+	}
+	return &conf, nil
+}
+
+func NewTokenSource() *TokenSource {
+	ts := &TokenSource{}
+	ts.token = goldfish.New(1*time.Second, ts.readTokenFromConfig)
+	ts.cfg = &oauth2.Config{
+		Endpoint: oauth2.Endpoint{
+			TokenURL: APIBaseURL + "/login/oauth:refresh-token",
+		},
+	}
+	return ts
+}
+
+// TokenSource implements oauth2.TokenSource by looking up the
+// current logged in user's API Token.
+type TokenSource struct {
+	token *goldfish.Cache[*oauth2.Token]
+	cfg   *oauth2.Config
+}
+
+// Token implements oauth2.TokenSource.
+func (ts *TokenSource) Token() (*oauth2.Token, error) {
+	baseToken, err := ts.token.Get()
+	if err != nil {
+		return nil, err
+	}
+
+	// Use the built-in token source to simplify the logic of
+	// refreshing the token as necessary.
+	fetch := ts.cfg.TokenSource(context.Background(), baseToken)
+	token, err := fetch.Token()
+	if err != nil {
+		var re *oauth2.RetrieveError
+		if errors.As(err, &re) && re.Response.StatusCode == 422 {
+			// The refresh token is invalid. Log the user out to reset the token.
+			_ = Logout()
+			return nil, ErrInvalidRefreshToken
+		}
+	} else if token.AccessToken != baseToken.AccessToken {
+		// The token has changed, so update the config.
+		cfg, err := CurrentUser()
+		if err != nil {
+			return nil, err
+		}
+		cfg.Token = *token
+		if err := Write(cfg); err != nil {
+			return nil, err
+		}
+	}
+	return token, err
+}
+
+// readTokenFromConfig reads the oauth token from the config file.
+func (ts *TokenSource) readTokenFromConfig() (*oauth2.Token, error) {
+	cfg, err := CurrentUser()
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, ErrNotLoggedIn
+	} else if err != nil {
+		return nil, fmt.Errorf("could not get Encore auth token: %v", err)
+	}
+
+	return &cfg.Token, nil
+}
+
+var DefaultTokenSource = NewTokenSource()
+
+// AuthClient is an *http.Client that authenticates requests
+// using the logged-in user.
+var AuthClient = oauth2.NewClient(nil, DefaultTokenSource)
+
+// DefaultClient is an *http.Client that authenticates requests if the user is logged in.
+// If the user is not logged in, the request is sent without authentication.
+var DefaultClient = &http.Client{Transport: defaultTransport{}}
+
+type defaultTransport struct{}
+
+var authTransport = oauth2.Transport{Base: http.DefaultTransport, Source: DefaultTokenSource}
+
+func (defaultTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if _, err := DefaultTokenSource.Token(); err != nil {
+		return http.DefaultTransport.RoundTrip(req)
+	}
+	return authTransport.RoundTrip(req)
+}

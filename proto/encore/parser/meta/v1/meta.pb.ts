@@ -2,6 +2,7 @@
 import type {
   Loc,
   Type,
+  Builtin,
   Decl,
 } from "../../../../encore/parser/schema/v1/schema.pb";
 
@@ -23,6 +24,11 @@ export interface Data {
   cron_jobs: CronJob[];
   /** All the pub sub topics declared in the application */
   pubsub_topics: PubSubTopic[];
+  middleware: Middleware[];
+  cache_clusters: CacheCluster[];
+  experiments: string[];
+  metrics: Metric[];
+  sql_databases: SQLDatabase[];
 }
 
 /**
@@ -61,15 +67,21 @@ export interface Service {
   migrations: DBMigration[];
   /** databases this service connects to */
   databases: string[];
+  /** true if the service has uses config */
+  has_config: boolean;
 }
 
-export interface DBMigration {
-  /** filename */
-  filename: string;
-  /** migration number */
-  number: number;
-  /** descriptive name */
-  description: string;
+export interface Selector {
+  type: Selector_Type;
+  value: string;
+}
+
+export enum Selector_Type {
+  UNKNOWN = "UNKNOWN",
+  ALL = "ALL",
+  /** TAG - NOTE: If more types are added, update the (selector.Selector).ToProto method. */
+  TAG = "TAG",
+  UNRECOGNIZED = "UNRECOGNIZED",
 }
 
 export interface RPC {
@@ -89,6 +101,7 @@ export interface RPC {
   loc: Loc;
   path: Path;
   http_methods: string[];
+  tags: Selector[];
 }
 
 export enum RPC_AccessType {
@@ -118,6 +131,16 @@ export interface AuthHandler {
   params?: Type | undefined;
 }
 
+export interface Middleware {
+  name: QualifiedName;
+  doc: string;
+  loc: Loc;
+  global: boolean;
+  /** nil if global */
+  service_name?: string | undefined;
+  target: Selector[];
+}
+
 export interface TraceNode {
   id: number;
   /** slash-separated, relative to app root */
@@ -135,6 +158,9 @@ export interface TraceNode {
   pubsub_topic_def: PubSubTopicDefNode | undefined;
   pubsub_publish: PubSubPublishNode | undefined;
   pubsub_subscriber: PubSubSubscriberNode | undefined;
+  service_init: ServiceInitNode | undefined;
+  middleware_def: MiddlewareDefNode | undefined;
+  cache_keyspace: CacheKeyspaceDefNode | undefined;
 }
 
 export interface RPCDefNode {
@@ -185,8 +211,35 @@ export interface PubSubSubscriberNode {
   context: string;
 }
 
+export interface ServiceInitNode {
+  service_name: string;
+  setup_func_name: string;
+  context: string;
+}
+
+export interface MiddlewareDefNode {
+  pkg_rel_path: string;
+  name: string;
+  context: string;
+  target: Selector[];
+}
+
+export interface CacheKeyspaceDefNode {
+  pkg_rel_path: string;
+  var_name: string;
+  cluster_name: string;
+  context: string;
+}
+
 export interface Path {
   segments: PathSegment[];
+  type: Path_Type;
+}
+
+export enum Path_Type {
+  URL = "URL",
+  CACHE_KEYSPACE = "CACHE_KEYSPACE",
+  UNRECOGNIZED = "UNRECOGNIZED",
 }
 
 export interface PathSegment {
@@ -199,6 +252,7 @@ export enum PathSegment_SegmentType {
   LITERAL = "LITERAL",
   PARAM = "PARAM",
   WILDCARD = "WILDCARD",
+  FALLBACK = "FALLBACK",
   UNRECOGNIZED = "UNRECOGNIZED",
 }
 
@@ -225,6 +279,26 @@ export interface CronJob {
   doc: string;
   schedule: string;
   endpoint: QualifiedName;
+}
+
+export interface SQLDatabase {
+  name: string;
+  doc: string;
+  /**
+   * migration_rel_path is the slash-separated path to the migrations,
+   * relative to the main module's root directory.
+   */
+  migration_rel_path: string;
+  migrations: DBMigration[];
+}
+
+export interface DBMigration {
+  /** filename */
+  filename: string;
+  /** migration number */
+  number: number;
+  /** descriptive name */
+  description: string;
 }
 
 export interface PubSubTopic {
@@ -277,4 +351,48 @@ export interface PubSubTopic_RetryPolicy {
   max_backoff: number;
   /** max number of retries */
   max_retries: number;
+}
+
+export interface CacheCluster {
+  /** The pub sub topic name (unique per application) */
+  name: string;
+  /** The documentation for the topic */
+  doc: string;
+  /** The publishers for this topic */
+  keyspaces: CacheCluster_Keyspace[];
+  /** redis eviction policy */
+  eviction_policy: string;
+}
+
+export interface CacheCluster_Keyspace {
+  key_type: Type;
+  value_type: Type;
+  service: string;
+  doc: string;
+  path_pattern: Path;
+}
+
+export interface Metric {
+  /** the name of the metric */
+  name: string;
+  value_type: Builtin;
+  /** the doc string */
+  doc: string;
+  kind: Metric_MetricKind;
+  /** the service the metric is exclusive to, if any. */
+  service_name?: string | undefined;
+  labels: Metric_Label[];
+}
+
+export enum Metric_MetricKind {
+  COUNTER = "COUNTER",
+  GAUGE = "GAUGE",
+  HISTOGRAM = "HISTOGRAM",
+  UNRECOGNIZED = "UNRECOGNIZED",
+}
+
+export interface Metric_Label {
+  key: string;
+  type: Builtin;
+  doc: string;
 }

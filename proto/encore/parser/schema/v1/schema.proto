@@ -12,14 +12,57 @@ package encore.parser.schema.v1;
 message Type {
   oneof typ {
     /* Concrete / non-parameterized Types */
-    Named            named          = 1; // A "named" type (https://tip.golang.org/ref/spec#Types)
-    Struct           struct         = 2; // The type is a struct definition
-    Map              map            = 3; // The type is a map
-    List             list           = 4; // The type is a slice
-    Builtin          builtin        = 5; // The type is one of the base built in types within Go
+    Named            named          =  1; // A "named" type (https://tip.golang.org/ref/spec#Types)
+    Struct           struct         =  2; // The type is a struct definition
+    Map              map            =  3; // The type is a map
+    List             list           =  4; // The type is a slice
+    Builtin          builtin        =  5; // The type is one of the base built in types within Go
+    Pointer          pointer        =  8; // The type is a pointer
+    Union            union          =  9; // The type is a union
+    Literal          literal        =  10; // The type is a literal
 
     /* Abstract Types */
-    TypeParameterRef type_parameter = 6; // This is placeholder for a unknown type within the declaration block
+    TypeParameterRef type_parameter =  6; // This is placeholder for a unknown type within the declaration block
+
+    /* Encore Special Types */
+    ConfigValue config              =  7; // This value is a config value
+  }
+
+  optional ValidationExpr validation = 15; // The validation expression for this type
+}
+
+message ValidationRule {
+  oneof rule {
+    uint64 min_len          = 1;
+    uint64 max_len          = 2;
+    double min_val          = 3;
+    double max_val          = 4;
+    string starts_with      = 5;
+    string ends_with        = 6;
+    string matches_regexp   = 7;
+    Is     is               = 8;
+  }
+
+  enum Is {
+    UNKNOWN = 0;
+    EMAIL   = 1;
+    URL     = 2;
+  }
+}
+
+message ValidationExpr {
+  oneof expr {
+    ValidationRule rule = 1;
+    And            and  = 2;
+    Or             or   = 3;
+  }
+
+  message And {
+    repeated ValidationExpr exprs = 1;
+  }
+
+  message Or {
+    repeated ValidationExpr exprs = 1;
   }
 }
 
@@ -33,13 +76,13 @@ message TypeParameterRef {
 // concrete when there are zero type parameters assigned.
 //
 // For example the Go Code:
-// ```
+// ```go
 // // Set[A] represents our set type
 // type Set[A any] = map[A]struct{}
 // ```
 //
 // Would become:
-// ```
+// ```go
 // _ = &Decl{
 //     id: 1,
 //     name: "Set",
@@ -103,6 +146,27 @@ message Field {
   string query_string_name = 6; // The query string name to use in GET/HEAD/DELETE requests. (The value "-" indicates to omit the field.)
   string raw_tag           = 7; // The original Go struct tag; should not be parsed individually
   repeated Tag tags        = 8; // Parsed go struct tags. Used for marshalling hints
+  optional WireSpec wire   = 9; // The explicitly set wire location of the field.
+}
+
+// WireLocation provides information about how a field should be encoded on the wire.
+message WireSpec {
+  oneof location {
+    Header header = 1;
+    Query  query  = 2;
+  }
+
+  message Header {
+    // The explicitly specified header name.
+    // If empty, the name of the field is used.
+    optional string name = 1;
+  }
+
+  message Query {
+    // The explicitly specified query string name.
+    // If empty, the name of the field is used.
+    optional string name = 1;
+  }
 }
 
 message Tag {
@@ -120,6 +184,33 @@ message Map {
 // List represents a list type (array or slice)
 message List {
   Type elem = 1; // The type of the elements in the list
+}
+
+// Pointer represents a pointer to a base type
+message Pointer {
+  Type base = 1; // The type of the pointer
+}
+
+// Union represents a union type.
+message Union {
+  repeated Type types = 1; // The types that make up the union
+}
+
+// Literal represents a literal value.
+message Literal {
+  oneof value {
+    string str     = 1;
+    bool   boolean = 2;
+    int64  int     = 3;
+    double float   = 4;
+    bool   null    = 5;
+  }
+}
+
+// ConfigValue represents a config value wrapper.
+message ConfigValue {
+  Type elem         = 1; // The type of the config value
+  bool IsValuesList = 2; // Does this config value represent the type to `config.Values[T]`. If false it represents `config.Value[T]`
 }
 
 // Builtin represents a type which Encore (and Go) have inbuilt support for and so can be represented by Encore's tooling

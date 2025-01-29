@@ -7,16 +7,20 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
-	"github.com/jackc/pgx/v4"
+	"github.com/cockroachdb/errors"
+	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog"
 	"go4.org/syncutil"
 	"golang.org/x/sync/errgroup"
 
+	"encr.dev/internal/optracker"
 	meta "encr.dev/proto/encore/parser/meta/v1"
 
 	// stdlib registers the "pgx" driver to database/sql.
-	_ "github.com/jackc/pgx/v4/stdlib"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 // Cluster represents a running database Cluster.
@@ -31,6 +35,10 @@ type Cluster struct {
 	startOnce syncutil.Once
 	// started is closed when the cluster has been successfully started.
 	started chan struct{}
+
+	// cachedStatus is the cached cluster status; it should be accessed
+	// via status().
+	cachedStatus atomic.Pointer[ClusterStatus]
 
 	Roles EncoreRoles // set by Start
 
@@ -53,7 +61,7 @@ func (c *Cluster) Ready() <-chan struct{} {
 
 // Start creates the cluster if necessary and starts it.
 // If the cluster is already running it does nothing.
-func (c *Cluster) Start(ctx context.Context) (*ClusterStatus, error) {
+func (c *Cluster) Start(ctx context.Context, tracker *optracker.OpTracker) (*ClusterStatus, error) {
 	var status *ClusterStatus
 	err := c.startOnce.Do(func() (err error) {
 		c.log.Debug().Msg("starting cluster")
@@ -69,11 +77,14 @@ func (c *Cluster) Start(ctx context.Context) (*ClusterStatus, error) {
 		st, err := c.driver.CreateCluster(ctx, &CreateParams{
 			ClusterID: c.ID,
 			Memfs:     c.Memfs,
+			Tracker:   tracker,
 		}, c.log)
 		if err != nil {
-			return err
+			return errors.WithStack(err)
 		}
 		status = st
+		c.cachedStatus.Store(st)
+		go c.pollStatus()
 
 		// Setup the roles
 		c.Roles, err = c.setupRoles(ctx, st)
@@ -82,7 +93,7 @@ func (c *Cluster) Start(ctx context.Context) (*ClusterStatus, error) {
 	})
 
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	} else if status == nil {
 		// We've already set it up; query the current status
 		return c.Status(ctx)
@@ -127,6 +138,19 @@ func (c *Cluster) setupRoles(ctx context.Context, st *ClusterStatus) (EncoreRole
 				return nil, fmt.Errorf("create role %q: %v", role.Username, err)
 			}
 			c.log.Debug().Str("role", role.Username).Msg("role already exists")
+		}
+
+		// Add cluster-level permissions.
+		switch role.Type {
+		case RoleAdmin:
+			// Grant admins the ability to create databases.
+			_, err := conn.Exec(ctx, `
+				ALTER USER `+sanitizedUsername+` CREATEDB
+			`)
+			if err != nil {
+				c.log.Error().Err(err).Str("role", role.Username).Msg("unable to grant CREATEDB")
+				return nil, fmt.Errorf("grant CREATEDB to %q: %v", role.Username, err)
+			}
 		}
 	}
 
@@ -177,15 +201,13 @@ func (c *Cluster) initDBs(md *meta.Data, reinit bool) {
 
 	// Create the databases we need in our cluster map.
 	c.mu.Lock()
-	for _, svc := range md.Svcs {
-		if len(svc.Migrations) > 0 {
-			db, ok := c.dbs[svc.Name]
-			if ok && reinit {
-				db.CloseConns()
-			}
-			if !ok || reinit {
-				c.initDB(svc.Name)
-			}
+	for _, dbMeta := range md.SqlDatabases {
+		db, ok := c.dbs[dbMeta.Name]
+		if ok && reinit {
+			db.CloseConns()
+		}
+		if !ok || reinit {
+			c.initDB(dbMeta.Name)
 		}
 	}
 	c.mu.Unlock()
@@ -193,19 +215,34 @@ func (c *Cluster) initDBs(md *meta.Data, reinit bool) {
 
 // initDB initializes the database for svc and adds it to c.dbs.
 // The cluster mutex must be held.
-func (c *Cluster) initDB(name string) *DB {
+func (c *Cluster) initDB(encoreName string) *DB {
+	driverName := encoreName
+	if !c.driver.Meta().ClusterIsolation {
+		driverName += fmt.Sprintf("-%s-%s", c.ID.NS.App.PlatformOrLocalID(), c.ID.Type)
+
+		// Add the namespace id, as long as it's not the default namespace
+		// (for backwards compatibility).
+		if c.ID.NS.Name != "default" {
+			driverName += "-" + string(c.ID.NS.ID)
+		}
+	}
+
 	dbCtx, cancel := context.WithCancel(c.Ctx)
 	db := &DB{
-		Name:    name,
-		Cluster: c,
+		EncoreName: encoreName,
+		Cluster:    c,
+		driverName: driverName,
+
+		// Use a template database when running tests.
+		template: c.ID.Type == Test,
 
 		Ctx:    dbCtx,
 		cancel: cancel,
 
 		ready: make(chan struct{}),
-		log:   c.log.With().Str("db", name).Logger(),
+		log:   c.log.With().Str("db", encoreName).Logger(),
 	}
-	c.dbs[name] = db
+	c.dbs[encoreName] = db
 	return db
 }
 
@@ -213,20 +250,16 @@ func (c *Cluster) initDB(name string) *DB {
 func (c *Cluster) Setup(ctx context.Context, appRoot string, md *meta.Data) error {
 	c.log.Debug().Msg("creating cluster")
 	g, ctx := errgroup.WithContext(ctx)
-
+	g.SetLimit(50)
 	c.mu.Lock()
 
-	for _, svc := range md.Svcs {
-		if len(svc.Migrations) == 0 {
-			continue
-		}
-
-		svc := svc
-		db, ok := c.dbs[svc.Name]
+	for _, dbMeta := range md.SqlDatabases {
+		dbMeta := dbMeta
+		db, ok := c.dbs[dbMeta.Name]
 		if !ok {
-			db = c.initDB(svc.Name)
+			db = c.initDB(dbMeta.Name)
 		}
-		g.Go(func() error { return db.Setup(ctx, appRoot, svc, false, false) })
+		g.Go(func() error { return db.Setup(ctx, appRoot, dbMeta, false, false) })
 	}
 	c.mu.Unlock()
 	return g.Wait()
@@ -236,19 +269,16 @@ func (c *Cluster) Setup(ctx context.Context, appRoot string, md *meta.Data) erro
 func (c *Cluster) SetupAndMigrate(ctx context.Context, appRoot string, md *meta.Data) error {
 	c.log.Debug().Msg("creating and migrating cluster")
 	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(50)
 	c.mu.Lock()
 
-	for _, svc := range md.Svcs {
-		if len(svc.Migrations) == 0 {
-			continue
-		}
-
-		svc := svc
-		db, ok := c.dbs[svc.Name]
+	for _, dbMeta := range md.SqlDatabases {
+		dbMeta := dbMeta
+		db, ok := c.dbs[dbMeta.Name]
 		if !ok {
-			db = c.initDB(svc.Name)
+			db = c.initDB(dbMeta.Name)
 		}
-		g.Go(func() error { return db.Setup(ctx, appRoot, svc, true, false) })
+		g.Go(func() error { return db.Setup(ctx, appRoot, dbMeta, true, false) })
 	}
 	c.mu.Unlock()
 	return g.Wait()
@@ -262,28 +292,29 @@ func (c *Cluster) GetDB(name string) (*DB, bool) {
 	return db, ok
 }
 
-// Recreate recreates the databases for the given services.
-// If services is the nil slice it recreates all databases.
-func (c *Cluster) Recreate(ctx context.Context, appRoot string, services []string, md *meta.Data) error {
+// Recreate recreates the databases for the given database names.
+// If databaseNames is the nil slice it recreates all databases.
+func (c *Cluster) Recreate(ctx context.Context, appRoot string, databaseNames []string, md *meta.Data) error {
 	c.log.Debug().Msg("recreating cluster")
 	var filter map[string]bool
-	if services != nil {
+	if databaseNames != nil {
 		filter = make(map[string]bool)
-		for _, svc := range services {
-			filter[svc] = true
+		for _, name := range databaseNames {
+			filter[name] = true
 		}
 	}
 
 	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(50)
 	c.mu.Lock()
-	for _, svc := range md.Svcs {
-		svc := svc
-		if len(svc.Migrations) > 0 && (filter == nil || filter[svc.Name]) {
-			db, ok := c.dbs[svc.Name]
+	for _, dbMeta := range md.SqlDatabases {
+		dbMeta := dbMeta
+		if filter == nil || filter[dbMeta.Name] {
+			db, ok := c.dbs[dbMeta.Name]
 			if !ok {
-				db = c.initDB(svc.Name)
+				db = c.initDB(dbMeta.Name)
 			}
-			g.Go(func() error { return db.Setup(ctx, appRoot, svc, true, true) })
+			g.Go(func() error { return db.Setup(ctx, appRoot, dbMeta, true, true) })
 		}
 	}
 	c.mu.Unlock()
@@ -294,12 +325,41 @@ func (c *Cluster) Recreate(ctx context.Context, appRoot string, services []strin
 
 // Status reports the cluster's status.
 func (c *Cluster) Status(ctx context.Context) (*ClusterStatus, error) {
-	return c.driver.ClusterStatus(ctx, c.ID)
+	if st := c.cachedStatus.Load(); st != nil {
+		return st, nil
+	}
+	return c.updateStatusFromDriver(ctx)
+}
+
+func (c *Cluster) updateStatusFromDriver(ctx context.Context) (*ClusterStatus, error) {
+	st, err := c.driver.ClusterStatus(ctx, c.ID)
+	if err == nil {
+		c.cachedStatus.Store(st)
+	}
+	return st, err
+}
+
+// pollStatus polls the driver for status changes.
+func (c *Cluster) pollStatus() {
+	ch := time.NewTicker(10 * time.Second)
+	defer ch.Stop()
+
+	for {
+		select {
+		case <-ch.C:
+			ctx, cancel := context.WithTimeout(c.Ctx, 5*time.Second)
+			_, _ = c.updateStatusFromDriver(ctx)
+			cancel()
+
+		case <-c.Ctx.Done():
+			return
+		}
+	}
 }
 
 // Info reports information about a cluster.
 func (c *Cluster) Info(ctx context.Context) (*ClusterInfo, error) {
-	st, err := c.Start(ctx)
+	st, err := c.Start(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -364,6 +424,8 @@ func (roles EncoreRoles) find(typ RoleType) (Role, bool) {
 }
 
 type RoleType string
+
+func (r RoleType) String() string { return string(r) }
 
 const (
 	RoleSuperuser RoleType = "superuser"

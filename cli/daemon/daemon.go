@@ -4,30 +4,34 @@ package daemon
 import (
 	"bytes"
 	"context"
-	"errors"
 	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	"golang.org/x/mod/semver"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"encr.dev/cli/daemon/apps"
+	"encr.dev/cli/daemon/namespace"
 	"encr.dev/cli/daemon/run"
 	"encr.dev/cli/daemon/secret"
 	"encr.dev/cli/daemon/sqldb"
-	"encr.dev/cli/internal/appfile"
-	"encr.dev/cli/internal/codegen"
 	"encr.dev/cli/internal/platform"
 	"encr.dev/cli/internal/update"
-	"encr.dev/cli/internal/version"
+	"encr.dev/internal/clientgen"
+	"encr.dev/internal/clientgen/clientgentypes"
+	"encr.dev/internal/version"
+	"encr.dev/pkg/builder"
+	"encr.dev/pkg/builder/builderimpl"
+	"encr.dev/pkg/errlist"
+	"encr.dev/pkg/fns"
 	daemonpb "encr.dev/proto/encore/daemon"
 	meta "encr.dev/proto/encore/parser/meta/v1"
 )
@@ -40,6 +44,7 @@ type Server struct {
 	mgr  *run.Manager
 	cm   *sqldb.ClusterManager
 	sm   *secret.Manager
+	ns   *namespace.Manager
 
 	mu      sync.Mutex
 	streams map[string]*streamLog // run id -> stream
@@ -47,30 +52,48 @@ type Server struct {
 	availableVerInit sync.Once
 	availableVer     atomic.Value // string
 
+	appDebounceMu sync.Mutex
+	appDebouncers map[*apps.Instance]*regenerateCodeDebouncer
+
 	daemonpb.UnimplementedDaemonServer
 }
 
 // New creates a new Server.
-func New(apps *apps.Manager, mgr *run.Manager, cm *sqldb.ClusterManager, sm *secret.Manager) *Server {
+func New(appsMgr *apps.Manager, mgr *run.Manager, cm *sqldb.ClusterManager, sm *secret.Manager, ns *namespace.Manager) *Server {
 	srv := &Server{
-		apps:    apps,
+		apps:    appsMgr,
 		mgr:     mgr,
 		cm:      cm,
 		sm:      sm,
+		ns:      ns,
 		streams: make(map[string]*streamLog),
+
+		appDebouncers: make(map[*apps.Instance]*regenerateCodeDebouncer),
 	}
+
 	mgr.AddListener(srv)
+
 	// Check immediately for the latest version to avoid blocking 'encore run'
 	go srv.availableUpdate()
+
+	// Begin watching known apps for changes
+	go srv.watchApps()
+
 	return srv
 }
 
 // GenClient generates a client based on the app's API.
 func (s *Server) GenClient(ctx context.Context, params *daemonpb.GenClientRequest) (*daemonpb.GenClientResponse, error) {
 	var md *meta.Data
-	if params.EnvName == "local" {
+
+	envName := params.EnvName
+	if envName == "" {
+		envName = "local"
+	}
+
+	if envName == "local" {
 		// Determine the app root
-		app, err := s.apps.FindLatestByPlatformID(params.AppId)
+		app, err := s.apps.FindLatestByPlatformOrLocalID(params.AppId)
 		if errors.Is(err, apps.ErrNotFound) {
 			return nil, status.Errorf(codes.FailedPrecondition, "the app %s must be run locally before generating a client for the 'local' environment.",
 				params.AppId)
@@ -79,19 +102,33 @@ func (s *Server) GenClient(ctx context.Context, params *daemonpb.GenClientReques
 		}
 
 		// Get the app metadata
-		result, err := s.parseApp(app.Root(), ".", false)
+		expSet, err := app.Experiments(nil)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "failed to parse app experiments: %v", err)
+		}
+
+		// Parse the app to figure out what infrastructure is needed.
+		bld := builderimpl.Resolve(app.Lang(), expSet)
+		defer fns.CloseIgnore(bld)
+		parse, err := bld.Parse(ctx, builder.ParseParams{
+			Build:       builder.DefaultBuildInfo(),
+			App:         app,
+			Experiments: expSet,
+			WorkingDir:  ".",
+			ParseTests:  false,
+		})
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "failed to parse app metadata: %v", err)
 		}
-		md = result.Meta
-	} else {
-		envName := params.EnvName
-		if envName == "" {
-			envName = "@primary"
+		md = parse.Meta
+
+		if err := app.CacheMetadata(md); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to cache app metadata: %v", err)
 		}
+	} else {
 		meta, err := platform.GetEnvMeta(ctx, params.AppId, envName)
 		if err != nil {
-			if strings.Contains(err.Error(), "env_not_found") {
+			if strings.Contains(err.Error(), "env_not_found") || strings.Contains(err.Error(), "env_not_deployed") {
 				if envName == "@primary" {
 					return nil, status.Error(codes.NotFound, "You have no deployments of this application.\n\nYou can generate the client for your local code by setting `--env=local`.")
 				}
@@ -102,40 +139,28 @@ func (s *Server) GenClient(ctx context.Context, params *daemonpb.GenClientReques
 		md = meta
 	}
 
-	lang := codegen.Lang(params.Lang)
-	code, err := codegen.Client(lang, params.AppId, md)
+	lang := clientgen.Lang(params.Lang)
+
+	servicesToGenerate := clientgentypes.NewServiceSet(md, params.Services, params.ExcludedServices)
+	tagSet := clientgentypes.NewTagSet(params.EndpointTags, params.ExcludedEndpointTags)
+	opts := clientgentypes.Options{}
+	if params.OpenapiExcludePrivateEndpoints != nil {
+		opts.OpenAPIExcludePrivateEndpoints = *params.OpenapiExcludePrivateEndpoints
+	}
+	code, err := clientgen.Client(lang, params.AppId, md, servicesToGenerate, tagSet, opts)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	return &daemonpb.GenClientResponse{Code: code}, nil
 }
 
-// SetSecret sets a secret key on the encore.dev platform.
-func (s *Server) SetSecret(ctx context.Context, req *daemonpb.SetSecretRequest) (*daemonpb.SetSecretResponse, error) {
-	// Get the app id from the app file
-	appSlug, err := appfile.Slug(req.AppRoot)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, err.Error())
-	} else if appSlug == "" {
-		return nil, errNotLinked
-	}
-
-	var kind platform.SecretKind
-	switch req.Type {
-	case daemonpb.SetSecretRequest_DEVELOPMENT:
-		kind = platform.DevelopmentSecrets
-	case daemonpb.SetSecretRequest_PRODUCTION:
-		kind = platform.ProductionSecrets
-	default:
-		return nil, status.Errorf(codes.InvalidArgument, "unknown secret type %v", req.Type)
-	}
-
-	ver, err := platform.SetAppSecret(ctx, appSlug, kind, req.Key, req.Value)
+func (s *Server) SecretsRefresh(ctx context.Context, req *daemonpb.SecretsRefreshRequest) (*daemonpb.SecretsRefreshResponse, error) {
+	app, err := s.apps.Track(req.AppRoot)
 	if err != nil {
 		return nil, err
 	}
-	go s.sm.UpdateKey(appSlug, req.Key, req.Value)
-	return &daemonpb.SetSecretResponse{Created: ver.Number == 1}, nil
+	s.sm.UpdateKey(app.PlatformID(), req.Key, req.Value)
+	return &daemonpb.SecretsRefreshResponse{}, nil
 }
 
 // Version reports the daemon version.
@@ -153,8 +178,8 @@ func (s *Server) Version(context.Context, *empty.Empty) (*daemonpb.VersionRespon
 
 // availableUpdate checks for updates to Encore.
 // If there is a new version it returns it as a semver string.
-func (s *Server) availableUpdate() string {
-	check := func() string {
+func (s *Server) availableUpdate() *update.LatestVersion {
+	check := func() *update.LatestVersion {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		ver, err := update.Check(ctx)
@@ -170,7 +195,7 @@ func (s *Server) availableUpdate() string {
 		go func() {
 			for {
 				time.Sleep(1 * time.Hour)
-				if ver := check(); ver != "" {
+				if ver := check(); ver != nil {
 					s.availableVer.Store(ver)
 				}
 			}
@@ -178,12 +203,17 @@ func (s *Server) availableUpdate() string {
 	})
 
 	curr := version.Version
-	latest := s.availableVer.Load().(string)
-	if semver.Compare(latest, curr) > 0 {
+	latest := s.availableVer.Load().(*update.LatestVersion)
+	if latest.IsNewer(curr) {
 		return latest
 	}
-	return ""
+	return nil
 }
+
+var errDatabaseNotFound = (func() error {
+	st := status.New(codes.NotFound, "database not found")
+	return st.Err()
+})()
 
 var errNotLinked = (func() error {
 	st, err := status.New(codes.FailedPrecondition, "app not linked").WithDetails(
@@ -221,13 +251,17 @@ func (w streamWriter) Write(b []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.buffer && w.sl.buffered {
-		return w.sl.writeBuffered(&w.sl.stdout, b)
+		if w.stderr {
+			return w.sl.writeBuffered(&w.sl.stderr, b)
+		} else {
+			return w.sl.writeBuffered(&w.sl.stdout, b)
+		}
 	}
 	return w.sl.writeStream(w.stderr, b)
 }
 
 func streamExit(stream commandStream, code int) {
-	stream.Send(&daemonpb.CommandMessage{Msg: &daemonpb.CommandMessage_Exit{
+	_ = stream.Send(&daemonpb.CommandMessage{Msg: &daemonpb.CommandMessage_Exit{
 		Exit: &daemonpb.CommandExit{
 			Code: int32(code),
 		},
@@ -251,6 +285,12 @@ func (log *streamLog) Stderr(buffer bool) io.Writer {
 	return streamWriter{mu: &log.mu, sl: log, stderr: true, buffer: buffer}
 }
 
+func (log *streamLog) Error(err *errlist.List) {
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	_ = err.SendToStream(log.stream)
+}
+
 func (log *streamLog) FlushBuffers() {
 	var stdout, stderr []byte
 	log.mu.Lock()
@@ -264,8 +304,8 @@ func (log *streamLog) FlushBuffers() {
 		log.stderr = nil
 	}
 
-	log.writeStream(false, stderr)
-	log.writeStream(true, stdout)
+	_, _ = log.writeStream(false, stderr)
+	_, _ = log.writeStream(true, stdout)
 	log.buffered = false
 }
 

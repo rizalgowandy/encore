@@ -1,0 +1,253 @@
+---
+source: tsparser/src/parser/types/tests.rs
+expression: result
+input_file: tsparser/src/parser/types/testdata/generics.ts
+---
+{
+    "Generic1": Interface(
+        Interface {
+            fields: [
+                InterfaceField {
+                    name: String(
+                        "cond",
+                    ),
+                    optional: false,
+                    typ: Generic(
+                        Conditional(
+                            Conditional {
+                                check_type: Generic(
+                                    TypeParam(
+                                        TypeParam {
+                                            idx: 0,
+                                            constraint: None,
+                                        },
+                                    ),
+                                ),
+                                extends_type: Basic(
+                                    String,
+                                ),
+                                true_type: Literal(
+                                    String(
+                                        "literal",
+                                    ),
+                                ),
+                                false_type: Basic(
+                                    Number,
+                                ),
+                            },
+                        ),
+                    ),
+                },
+            ],
+            index: None,
+            call: None,
+        },
+    ),
+    "Generic2": Interface(
+        Interface {
+            fields: [
+                InterfaceField {
+                    name: String(
+                        "value",
+                    ),
+                    optional: false,
+                    typ: Generic(
+                        TypeParam(
+                            TypeParam {
+                                idx: 0,
+                                constraint: None,
+                            },
+                        ),
+                    ),
+                },
+                InterfaceField {
+                    name: String(
+                        "cond",
+                    ),
+                    optional: false,
+                    typ: Generic(
+                        Conditional(
+                            Conditional {
+                                check_type: Generic(
+                                    TypeParam(
+                                        TypeParam {
+                                            idx: 0,
+                                            constraint: None,
+                                        },
+                                    ),
+                                ),
+                                extends_type: Basic(
+                                    String,
+                                ),
+                                true_type: Literal(
+                                    String(
+                                        "literal",
+                                    ),
+                                ),
+                                false_type: Basic(
+                                    Number,
+                                ),
+                            },
+                        ),
+                    ),
+                },
+            ],
+            index: None,
+            call: None,
+        },
+    ),
+    "Concrete1": Interface(
+        Interface {
+            fields: [
+                InterfaceField {
+                    name: String(
+                        "one",
+                    ),
+                    optional: false,
+                    typ: Named(
+                        Named {
+                            obj: Object {
+                                name: Some(
+                                    "Generic1",
+                                ),
+                            },
+                            type_arguments: [
+                                Basic(
+                                    String,
+                                ),
+                            ],
+                        },
+                    ),
+                },
+                InterfaceField {
+                    name: String(
+                        "two",
+                    ),
+                    optional: false,
+                    typ: Named(
+                        Named {
+                            obj: Object {
+                                name: Some(
+                                    "Generic1",
+                                ),
+                            },
+                            type_arguments: [
+                                Literal(
+                                    String(
+                                        "test",
+                                    ),
+                                ),
+                            ],
+                        },
+                    ),
+                },
+                InterfaceField {
+                    name: String(
+                        "three",
+                    ),
+                    optional: false,
+                    typ: Named(
+                        Named {
+                            obj: Object {
+                                name: Some(
+                                    "Generic2",
+                                ),
+                            },
+                            type_arguments: [
+                                Basic(
+                                    Null,
+                                ),
+                            ],
+                        },
+                    ),
+                },
+                InterfaceField {
+                    name: String(
+                        "four",
+                    ),
+                    optional: false,
+                    typ: Named(
+                        Named {
+                            obj: Object {
+                                name: Some(
+                                    "Generic2",
+                                ),
+                            },
+                            type_arguments: [
+                                Named(
+                                    Named {
+                                        obj: Object {
+                                            name: Some(
+                                                "Generic1",
+                                            ),
+                                        },
+                                        type_arguments: [
+                                            Basic(
+                                                Boolean,
+                                            ),
+                                        ],
+                                    },
+                                ),
+                            ],
+                        },
+                    ),
+                },
+                InterfaceField {
+                    name: String(
+                        "five",
+                    ),
+                    optional: false,
+                    typ: Named(
+                        Named {
+                            obj: Object {
+                                name: Some(
+                                    "GenericIface",
+                                ),
+                            },
+                            type_arguments: [
+                                Named(
+                                    Named {
+                                        obj: Object {
+                                            name: Some(
+                                                "Generic1",
+                                            ),
+                                        },
+                                        type_arguments: [
+                                            Basic(
+                                                Boolean,
+                                            ),
+                                        ],
+                                    },
+                                ),
+                            ],
+                        },
+                    ),
+                },
+            ],
+            index: None,
+            call: None,
+        },
+    ),
+    "GenericIface": Interface(
+        Interface {
+            fields: [
+                InterfaceField {
+                    name: String(
+                        "foo",
+                    ),
+                    optional: false,
+                    typ: Generic(
+                        TypeParam(
+                            TypeParam {
+                                idx: 0,
+                                constraint: None,
+                            },
+                        ),
+                    ),
+                },
+            ],
+            index: None,
+            call: None,
+        },
+    ),
+}

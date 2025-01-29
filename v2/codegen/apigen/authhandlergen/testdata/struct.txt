@@ -1,0 +1,74 @@
+-- code.go --
+package code
+
+import ("context"; "net/http"; "encore.dev/beta/auth")
+
+type MyAuthParams struct {
+	ClientID string `header:"X-Client-ID"`
+	APIKey   string `query:"key"`
+	SessionToken string `cookie:"session_token"`
+	OtherCookie *http.Cookie `cookie:"other_cookie"`
+	IntCookie int `cookie:"int_cookie"`
+}
+
+//encore:authhandler
+func AuthHandler(ctx context.Context, p *MyAuthParams) (auth.UID, error) {
+    return "", nil
+}
+-- want:encore_internal__authhandler.go --
+package code
+
+import (
+	"context"
+	__api "encore.dev/appruntime/apisdk/api"
+	__model "encore.dev/appruntime/exported/model"
+	__etype "encore.dev/appruntime/shared/etype"
+	errs "encore.dev/beta/errs"
+	"net/http"
+)
+
+var EncoreInternal_authhandler_AuthDesc_AuthHandler = &__api.AuthHandlerDesc[*MyAuthParams]{
+	AuthHandler: func(ctx context.Context, params *MyAuthParams) (info __model.AuthInfo, err error) {
+		info.UID, err = AuthHandler(ctx, params)
+		return info, err
+	},
+	DecodeAuth: func(httpReq *http.Request) (params *MyAuthParams, err error) {
+		params = new(MyAuthParams)
+		dec := new(__etype.Unmarshaller)
+		// Decode headers
+		h := httpReq.Header
+		params.ClientID = __etype.UnmarshalOne(dec, __etype.UnmarshalString, "x-client-id", h.Get("x-client-id"), false)
+
+		// Decode query string
+		qs := httpReq.URL.Query()
+		params.APIKey = __etype.UnmarshalOne(dec, __etype.UnmarshalString, "key", qs.Get("key"), false)
+
+		// Decode cookies
+		if c, _ := httpReq.Cookie("session_token"); c != nil {
+			params.SessionToken = __etype.UnmarshalOne(dec, __etype.UnmarshalString, "session_token", c.Value, false)
+		}
+		if c, _ := httpReq.Cookie("other_cookie"); c != nil {
+			params.OtherCookie = c
+			dec.IncNonEmpty()
+		}
+		if c, _ := httpReq.Cookie("int_cookie"); c != nil {
+			params.IntCookie = __etype.UnmarshalOne(dec, __etype.UnmarshalInt, "int_cookie", c.Value, false)
+		}
+
+		if dec.NonEmptyValues == 0 {
+			return (*MyAuthParams)(nil), errs.B().Code(errs.Unauthenticated).Msg("missing auth param").Err()
+		} else if err := dec.Error; err != nil {
+			return (*MyAuthParams)(nil), errs.B().Code(errs.InvalidArgument).Msgf("invalid auth param: %v", err).Err()
+		}
+		return params, nil
+	},
+	DefLoc:      uint32(0x0),
+	Endpoint:    "AuthHandler",
+	HasAuthData: false,
+	Service:     "code",
+	SvcNum:      1,
+}
+
+func init() {
+	__api.RegisterAuthHandler(EncoreInternal_authhandler_AuthDesc_AuthHandler)
+}

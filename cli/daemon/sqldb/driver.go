@@ -5,6 +5,9 @@ import (
 	"errors"
 
 	"github.com/rs/zerolog"
+
+	"encr.dev/cli/daemon/namespace"
+	"encr.dev/internal/optracker"
 )
 
 var ErrUnsupported = errors.New("unsupported operation")
@@ -16,12 +19,33 @@ type Driver interface {
 	// err is nil if and only if the cluster could not be started.
 	CreateCluster(ctx context.Context, p *CreateParams, log zerolog.Logger) (*ClusterStatus, error)
 
+	// CanDestroyCluster reports whether the cluster could be destroyed, if desired.
+	// If a Driver doesn't support destroying the cluster it reports ErrUnsupported.
+	CanDestroyCluster(ctx context.Context, id ClusterID) error
+
 	// DestroyCluster destroys a cluster with the given id.
 	// If a Driver doesn't support destroying the cluster it reports ErrUnsupported.
 	DestroyCluster(ctx context.Context, id ClusterID) error
 
+	// DestroyNamespaceData destroys the data associated with a namespace.
+	// If a Driver doesn't support destroying data it reports ErrUnsupported.
+	DestroyNamespaceData(ctx context.Context, ns *namespace.Namespace) error
+
 	// ClusterStatus reports the current status of a cluster.
 	ClusterStatus(ctx context.Context, id ClusterID) (*ClusterStatus, error)
+
+	// CheckRequirements checks whether all the requirements are met
+	// to use the driver.
+	CheckRequirements(ctx context.Context) error
+
+	// Meta reports driver metadata.
+	Meta() DriverMeta
+}
+
+type DriverMeta struct {
+	// ClusterIsolation reports whether clusters are isolated by the driver.
+	// If false, database names will be prefixed with the cluster id.
+	ClusterIsolation bool
 }
 
 type ConnConfig struct {
@@ -38,9 +62,21 @@ type ConnConfig struct {
 type ClusterType string
 
 const (
-	Run  ClusterType = "run"
-	Test ClusterType = "test"
+	Run    ClusterType = "run"
+	Shadow ClusterType = "shadow"
+	Test   ClusterType = "test"
 )
+
+func (ct ClusterType) Memfs() bool {
+	switch ct {
+	case Run:
+		return false
+	case Shadow, Test:
+		return true
+	default:
+		return false
+	}
+}
 
 // CreateParams are the params to (*ClusterManager).Create.
 type CreateParams struct {
@@ -49,6 +85,9 @@ type CreateParams struct {
 	// Memfs, if true, configures the database container to use an
 	// in-memory filesystem as opposed to persisting the database to disk.
 	Memfs bool
+
+	// Tracker allows tracking the progress of the operation.
+	Tracker *optracker.OpTracker
 }
 
 // Status represents the status of a container.

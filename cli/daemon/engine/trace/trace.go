@@ -15,7 +15,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"encore.dev/runtime/trace"
+	"encore.dev/appruntime/exported/trace"
 	"encr.dev/cli/daemon/apps"
 	"encr.dev/cli/daemon/internal/sym"
 	"encr.dev/pkg/eerror"
@@ -36,8 +36,9 @@ type TraceMeta struct {
 
 // A Store stores traces received from running applications.
 type Store struct {
-	trmu   sync.Mutex
-	traces map[string][]*TraceMeta
+	trmu             sync.Mutex
+	traces           map[string][]*TraceMeta
+	requestIDMapping map[string]*tracepb.Request // Trace ID -> Request
 
 	lnmu sync.Mutex
 	ln   map[chan<- *TraceMeta]struct{}
@@ -45,8 +46,9 @@ type Store struct {
 
 func NewStore() *Store {
 	return &Store{
-		traces: make(map[string][]*TraceMeta),
-		ln:     make(map[chan<- *TraceMeta]struct{}),
+		traces:           make(map[string][]*TraceMeta),
+		requestIDMapping: make(map[string]*tracepb.Request),
+		ln:               make(map[chan<- *TraceMeta]struct{}),
 	}
 }
 
@@ -60,6 +62,17 @@ func (st *Store) Store(ctx context.Context, tr *TraceMeta) error {
 	appID := tr.App.PlatformOrLocalID()
 	st.trmu.Lock()
 	st.traces[appID] = append(st.traces[appID], tr)
+
+	const limit = 100
+	// Remove earlier traces if we exceed the limit.
+	if n := len(st.traces[appID]); n > limit {
+		st.traces[appID] = st.traces[appID][n-limit:]
+	}
+
+	for _, req := range tr.Reqs {
+		st.requestIDMapping[req.TraceId.String()] = req
+	}
+
 	st.trmu.Unlock()
 
 	st.lnmu.Lock()
@@ -72,6 +85,19 @@ func (st *Store) Store(ctx context.Context, tr *TraceMeta) error {
 		}
 	}
 	return nil
+}
+
+func (st *Store) GetRootTrace(traceID *tracepb.TraceID) (rtn *tracepb.Request) {
+	st.trmu.Lock()
+	defer st.trmu.Unlock()
+
+	next := st.requestIDMapping[traceID.String()]
+	for next != nil {
+		rtn = next
+		next = st.requestIDMapping[rtn.ParentTraceId.String()]
+	}
+
+	return rtn
 }
 
 func (st *Store) List(appID string) []*TraceMeta {
@@ -87,18 +113,20 @@ func Parse(log *zerolog.Logger, traceID ID, data []byte, version trace.Version, 
 		High: bin.Uint64(traceID[8:]),
 	}
 	tp := &traceParser{
-		log:         log,
-		version:     version,
-		traceReader: traceReader{buf: data},
-		symTable:    symTable,
-		traceID:     id,
-		reqMap:      make(map[uint64]*tracepb.Request),
-		txMap:       make(map[uint64]*tracepb.DBTransaction),
-		queryMap:    make(map[uint64]*tracepb.DBQuery),
-		callMap:     make(map[uint64]interface{}),
-		goMap:       make(map[goKey]*tracepb.Goroutine),
-		httpMap:     make(map[uint64]*tracepb.HTTPCall),
-		publishMap:  make(map[uint64]*tracepb.PubsubMsgPublished),
+		log:          log,
+		version:      version,
+		traceReader:  traceReader{buf: data},
+		symTable:     symTable,
+		traceID:      id,
+		reqMap:       make(map[uint64]*tracepb.Request),
+		txMap:        make(map[uint64]*tracepb.DBTransaction),
+		queryMap:     make(map[uint64]*tracepb.DBQuery),
+		callMap:      make(map[uint64]interface{}),
+		goMap:        make(map[goKey]*tracepb.Goroutine),
+		httpMap:      make(map[uint64]*tracepb.HTTPCall),
+		publishMap:   make(map[uint64]*tracepb.PubsubMsgPublished),
+		serviceInits: make(map[uint64]*tracepb.ServiceInit),
+		cacheMap:     make(map[uint64]*tracepb.CacheOp),
 	}
 	if err := tp.Parse(); err != nil {
 		return nil, err
@@ -117,23 +145,25 @@ type SymTabler interface {
 
 type traceParser struct {
 	traceReader
-	log        *zerolog.Logger
-	version    trace.Version
-	symTable   SymTabler
-	traceID    *tracepb.TraceID
-	reqs       []*tracepb.Request
-	reqMap     map[uint64]*tracepb.Request
-	txMap      map[uint64]*tracepb.DBTransaction
-	queryMap   map[uint64]*tracepb.DBQuery
-	callMap    map[uint64]interface{} // *RPCCall or *AuthCall
-	httpMap    map[uint64]*tracepb.HTTPCall
-	goMap      map[goKey]*tracepb.Goroutine
-	publishMap map[uint64]*tracepb.PubsubMsgPublished
+	log          *zerolog.Logger
+	version      trace.Version
+	symTable     SymTabler
+	traceID      *tracepb.TraceID
+	reqs         []*tracepb.Request
+	reqMap       map[uint64]*tracepb.Request
+	txMap        map[uint64]*tracepb.DBTransaction
+	queryMap     map[uint64]*tracepb.DBQuery
+	callMap      map[uint64]interface{} // *RPCCall or *AuthCall
+	httpMap      map[uint64]*tracepb.HTTPCall
+	goMap        map[goKey]*tracepb.Goroutine
+	publishMap   map[uint64]*tracepb.PubsubMsgPublished
+	serviceInits map[uint64]*tracepb.ServiceInit
+	cacheMap     map[uint64]*tracepb.CacheOp
 }
 
 func (tp *traceParser) Parse() error {
 	for i := 0; !tp.Done(); i++ {
-		ev := trace.TraceEvent(tp.Byte())
+		ev := trace.EventType(tp.Byte())
 		ts := tp.Uint64()
 		size := int(tp.Uint32())
 		startOff := tp.Offset()
@@ -168,7 +198,7 @@ func (tp *traceParser) Parse() error {
 
 var errUnknownEvent = errors.New("unknown event")
 
-func (tp *traceParser) parseEventV3(ev trace.TraceEvent, ts uint64, size int) error {
+func (tp *traceParser) parseEventV3(ev trace.EventType, ts uint64, size int) error {
 	switch ev {
 	case trace.RequestStart:
 		return tp.requestStart(ts)
@@ -209,6 +239,16 @@ func (tp *traceParser) parseEventV3(ev trace.TraceEvent, ts uint64, size int) er
 		return tp.publishStart(ts)
 	case trace.PublishEnd:
 		return tp.publishEnd(ts)
+	case trace.ServiceInitStart:
+		return tp.serviceInitStart(ts)
+	case trace.ServiceInitEnd:
+		return tp.serviceInitEnd(ts)
+	case trace.CacheOpStart:
+		return tp.cacheOpStart(ts)
+	case trace.CacheOpEnd:
+		return tp.cacheOpEnd(ts)
+	case trace.BodyStream:
+		return tp.bodyStream(ts)
 	default:
 		return errUnknownEvent
 	}
@@ -249,16 +289,9 @@ func (tp *traceParser) parseEventV1(ev byte, ts uint64, size int) error {
 }
 
 func (tp *traceParser) requestStart(ts uint64) error {
-	var typ tracepb.Request_Type
-	switch b := tp.Byte(); b {
-	case 0x01:
-		typ = tracepb.Request_RPC
-	case 0x02:
-		typ = tracepb.Request_AUTH
-	case 0x03:
-		typ = tracepb.Request_PUBSUB_MSG
-	default:
-		return eerror.New("trace_parser", "unknown request type", map[string]any{"type": fmt.Sprintf("%x", b)})
+	typ, err := tp.parseRequestType()
+	if err != nil {
+		return err
 	}
 
 	// Determine the absolute start time.
@@ -271,53 +304,118 @@ func (tp *traceParser) requestStart(ts uint64) error {
 		absStart = time.Unix(0, int64(ts))
 	}
 
+	// Set the trace ID
+	traceID := tp.traceID
+	if tp.version >= 11 {
+		parsedTraceID := tp.parseTraceID()
+		if parsedTraceID.Low != 0 || parsedTraceID.High != 0 {
+			traceID = parsedTraceID
+		}
+	}
+	var parentTraceID *tracepb.TraceID
+	if tp.version >= 12 {
+		parentTraceID = tp.parseTraceID()
+	}
+
 	spanID := tp.Uint64()
 	parentSpanID := tp.Uint64()
 
 	var service, endpoint string
-	if tp.version >= 6 {
+	if tp.version < 6 {
+		service, endpoint = "unknown", "Unknown"
+	} else if tp.version < 9 {
 		service = tp.String()
 		endpoint = tp.String()
-	} else {
-		service, endpoint = "unknown", "Unknown"
 	}
 
 	goid := uint32(tp.UVarint())
-	_ = tp.UVarint() // skip CallLoc: no longer used
+	if tp.version < 9 {
+		_ = tp.UVarint() // skip CallLoc: no longer used
+	}
 	defLoc := int32(tp.UVarint())
-	uid := tp.String()
 
 	req := &tracepb.Request{
-		TraceId:      tp.traceID,
-		SpanId:       spanID,
-		ParentSpanId: parentSpanID,
-		StartTime:    ts,
-		ServiceName:  service,
-		EndpointName: endpoint,
-		AbsStartTime: uint64(absStart.UnixNano()),
+		TraceId:       traceID,
+		ParentTraceId: parentTraceID,
+		SpanId:        spanID,
+		ParentSpanId:  parentSpanID,
+		StartTime:     ts,
+		ServiceName:   service,
+		EndpointName:  endpoint,
+		AbsStartTime:  uint64(absStart.UnixNano()),
 		// EndTime not set yet
 		DefLoc: defLoc,
 		Goid:   goid,
-		Uid:    uid,
 		Type:   typ,
 	}
 
-	for n, i := tp.UVarint(), uint64(0); i < n; i++ {
-		size := tp.UVarint()
-		if size > (10 << 20) {
-			return eerror.New("trace_parser", "input too large", map[string]any{"size": size})
+	if tp.version < 9 {
+		req.Uid = tp.String()
+
+		for n, i := tp.UVarint(), uint64(0); i < n; i++ {
+			size := tp.UVarint()
+			if size > (10 << 20) {
+				return eerror.New("trace_parser", "input too large", map[string]any{"size": size})
+			}
+			input := make([]byte, size)
+			tp.Bytes(input)
+			req.Inputs = append(req.Inputs, input)
 		}
-		input := make([]byte, size)
-		tp.Bytes(input)
-		req.Inputs = append(req.Inputs, input)
 	}
 
-	if typ == tracepb.Request_PUBSUB_MSG {
+	switch typ {
+	case tracepb.Request_RPC:
+		if tp.version >= 9 {
+			isRaw := tp.Bool()
+			req.ServiceName = tp.String()
+			req.EndpointName = tp.String()
+			req.HttpMethod = tp.String()
+			req.Path = tp.String()
+
+			numParams := tp.UVarint()
+			req.PathParams = make([]string, numParams)
+			for i := uint64(0); i < numParams; i++ {
+				req.PathParams[i] = tp.String()
+			}
+
+			req.Uid = tp.String()
+
+			if tp.version >= 11 {
+				req.ExternalRequestId = tp.String()
+
+				if tp.version >= 12 {
+					req.ExternalCorrelationId = tp.String()
+				}
+			}
+
+			if isRaw {
+				req.RawRequestHeaders = tp.parseHTTPHeaders()
+			} else {
+				req.RequestPayload = tp.ByteString()
+			}
+		}
+
+	case tracepb.Request_AUTH:
+		if tp.version >= 9 {
+			req.ServiceName = tp.String()
+			req.EndpointName = tp.String()
+			req.RequestPayload = tp.ByteString()
+		}
+
+	case tracepb.Request_PUBSUB_MSG:
+		if tp.version >= 9 {
+			req.ServiceName = tp.String()
+		}
+
 		req.TopicName = tp.String()
 		req.SubscriptionName = tp.String()
 		req.MessageId = tp.String()
 		req.Attempt = tp.Uint32()
 		req.PublishTime = uint64(tp.Time().UnixMilli())
+
+		if tp.version >= 10 {
+			req.RequestPayload = tp.ByteString()
+		}
 	}
 
 	tp.reqs = append(tp.reqs, req)
@@ -325,36 +423,102 @@ func (tp *traceParser) requestStart(ts uint64) error {
 	return nil
 }
 
-func (tp *traceParser) requestEnd(ts uint64) error {
+func (tp *traceParser) bodyStream(ts uint64) error {
 	spanID := tp.Uint64()
 	req, ok := tp.reqMap[spanID]
 	if !ok {
 		return eerror.New("trace_parser", "unknown request span", map[string]any{"spanID": spanID})
 	}
+	flags := tp.Byte()
+	data := tp.ByteString()
+
+	isResponse := (flags & 1) == 1
+	overflowed := (flags & 2) == 2
+
+	req.Events = append(req.Events, &tracepb.Event{
+		Data: &tracepb.Event_BodyStream{
+			BodyStream: &tracepb.BodyStream{
+				IsResponse: isResponse,
+				Overflowed: overflowed,
+				Data:       data,
+			},
+		},
+	})
+
+	return nil
+}
+
+func (tp *traceParser) requestEnd(ts uint64) error {
+	var typ tracepb.Request_Type
+	if tp.version >= 9 {
+		var err error
+		typ, err = tp.parseRequestType()
+		if err != nil {
+			return err
+		}
+	}
+
+	spanID := tp.Uint64()
+	req, ok := tp.reqMap[spanID]
+	if !ok {
+		return eerror.New("trace_parser", "unknown request span", map[string]any{"spanID": spanID})
+	}
+	if tp.version < 9 {
+		// Not captured by the protocol for old versions,
+		// so grab it from the request.
+		typ = req.Type
+	}
+
 	// dur := ts - rd.startTs
 	req.EndTime = ts
 
-	if tp.Byte() == 0 {
-		// No error
-		for n, i := tp.UVarint(), uint64(0); i < n; i++ {
-			size := tp.UVarint()
-			if size > (10 << 20) {
-				return eerror.New("trace_parser", "input too large", map[string]any{"size": size})
+	if tp.version >= 9 {
+		errMsg := tp.ByteString()
+		if len(errMsg) > 0 {
+			req.Err = errMsg
+
+			req.ErrStack = tp.stack(filterNone)
+			if tp.version >= 13 {
+				req.PanicStack = tp.formattedStack()
 			}
-			output := make([]byte, size)
-			tp.Bytes(output)
-			req.Outputs = append(req.Outputs, output)
+		}
+
+		switch typ {
+		case tracepb.Request_RPC:
+			if isRaw := tp.Bool(); isRaw {
+				req.RawResponseHeaders = tp.parseHTTPHeaders()
+			} else {
+				req.ResponsePayload = tp.ByteString()
+			}
+		case tracepb.Request_AUTH:
+			req.Uid = tp.String()
+			req.ResponsePayload = tp.ByteString()
+		case tracepb.Request_PUBSUB_MSG:
+			req.ResponsePayload = tp.ByteString()
 		}
 	} else {
-		msg := tp.ByteString()
-		if len(msg) == 0 {
-			msg = []byte("unknown error")
-		}
-		req.Err = msg
-		if tp.version >= 5 {
-			req.ErrStack = tp.stack(filterNone)
+		isErr := tp.Bool()
+		if isErr {
+			msg := tp.ByteString()
+			if len(msg) == 0 {
+				msg = []byte("unknown error")
+			}
+			if tp.version >= 5 {
+				req.ErrStack = tp.stack(filterNone)
+			}
+		} else {
+			for n, i := tp.UVarint(), uint64(0); i < n; i++ {
+				size := tp.UVarint()
+				if size > (10 << 20) {
+					return eerror.New("trace_parser", "input too large", map[string]any{"size": size})
+				}
+				output := make([]byte, size)
+				tp.Bytes(output)
+				req.Outputs = append(req.Outputs, output)
+			}
 		}
 	}
+
 	return nil
 }
 
@@ -753,16 +917,36 @@ func (tp *traceParser) logMessage(ts uint64) error {
 		Time:   ts,
 		Msg:    msg,
 	}
-	switch level {
-	case 0:
-		log.Level = tracepb.LogMessage_DEBUG
-	case 1:
-		log.Level = tracepb.LogMessage_INFO
-	case 2:
-		log.Level = tracepb.LogMessage_ERROR
-	default:
-		return eerror.New("trace_parser", "unknown log message level", map[string]any{"level": level})
+
+	// We introduced more log levels in trace version 8.
+	if tp.version >= 8 {
+		switch level {
+		case 0:
+			log.Level = tracepb.LogMessage_TRACE
+		case 1:
+			log.Level = tracepb.LogMessage_DEBUG
+		case 2:
+			log.Level = tracepb.LogMessage_INFO
+		case 3:
+			log.Level = tracepb.LogMessage_WARN
+		case 4:
+			log.Level = tracepb.LogMessage_ERROR
+		default:
+			return eerror.New("trace_parser", "unknown log message level", map[string]any{"level": level})
+		}
+	} else {
+		switch level {
+		case 0:
+			log.Level = tracepb.LogMessage_DEBUG
+		case 1:
+			log.Level = tracepb.LogMessage_INFO
+		case 2:
+			log.Level = tracepb.LogMessage_ERROR
+		default:
+			return eerror.New("trace_parser", "unknown log message level", map[string]any{"level": level})
+		}
 	}
+
 	for i := 0; i < fields; i++ {
 		f, err := tp.logField()
 		if err != nil {
@@ -862,6 +1046,112 @@ func (tp *traceParser) publishEnd(ts uint64) error {
 	publish.EndTime = ts
 	publish.MessageId = tp.String()
 	publish.Err = tp.ByteString()
+	delete(tp.publishMap, publishID)
+	return nil
+}
+
+func (tp *traceParser) serviceInitStart(ts uint64) error {
+	spanID := tp.Uint64()
+	req, ok := tp.reqMap[spanID]
+	if !ok {
+		return eerror.New("trace_parser", "unknown request span", map[string]any{"spanID": spanID})
+	}
+
+	initID := tp.UVarint()
+	svcInit := &tracepb.ServiceInit{
+		Goid:      tp.UVarint(),
+		DefLoc:    int32(tp.UVarint()),
+		StartTime: ts,
+		Service:   tp.String(),
+	}
+	tp.serviceInits[initID] = svcInit
+
+	req.Events = append(req.Events, &tracepb.Event{
+		Data: &tracepb.Event_ServiceInit{ServiceInit: svcInit},
+	})
+	return nil
+}
+
+func (tp *traceParser) serviceInitEnd(ts uint64) error {
+	initID := tp.UVarint()
+	svcInit, ok := tp.serviceInits[initID]
+	if !ok {
+		return eerror.New("trace_parser", "unknown service init", map[string]any{"initID": initID})
+	}
+	svcInit.EndTime = ts
+	svcInit.Err = tp.ByteString()
+	if len(svcInit.Err) > 0 {
+		svcInit.ErrStack = tp.stack(filterNone)
+	}
+	delete(tp.serviceInits, initID)
+	return nil
+}
+
+func (tp *traceParser) cacheOpStart(ts uint64) error {
+	opID := tp.UVarint()
+	spanID := tp.Uint64()
+	req, ok := tp.reqMap[spanID]
+	if !ok {
+		return eerror.New("trace_parser", "unknown request span", map[string]any{"spanID": spanID})
+	}
+
+	op := &tracepb.CacheOp{
+		Goid:      uint32(tp.UVarint()),
+		DefLoc:    int32(tp.UVarint()),
+		StartTime: ts,
+		Operation: tp.String(),
+		Write:     tp.Bool(),
+		Result:    tracepb.CacheOp_UNKNOWN,
+		Stack:     tp.stack(filterNone),
+	}
+
+	numKeys := tp.UVarint()
+	op.Keys = make([]string, numKeys)
+	for i := 0; i < int(numKeys); i++ {
+		op.Keys[i] = tp.String()
+	}
+
+	numInputs := tp.UVarint()
+	op.Inputs = make([][]byte, numInputs)
+	for i := 0; i < int(numInputs); i++ {
+		op.Inputs[i] = tp.ByteString()
+	}
+	tp.cacheMap[opID] = op
+
+	req.Events = append(req.Events, &tracepb.Event{
+		Data: &tracepb.Event_Cache{Cache: op},
+	})
+	return nil
+}
+
+func (tp *traceParser) cacheOpEnd(ts uint64) error {
+	opID := tp.UVarint()
+	op, ok := tp.cacheMap[opID]
+	if !ok {
+		return eerror.New("trace_parser", "unknown cache", map[string]any{"opID": opID})
+	}
+	op.EndTime = ts
+
+	res := trace.CacheOpResult(tp.Byte())
+	switch res {
+	case trace.CacheOK:
+		op.Result = tracepb.CacheOp_OK
+	case trace.CacheNoSuchKey:
+		op.Result = tracepb.CacheOp_NO_SUCH_KEY
+	case trace.CacheConflict:
+		op.Result = tracepb.CacheOp_CONFLICT
+	case trace.CacheErr:
+		op.Result = tracepb.CacheOp_ERR
+		op.Err = tp.ByteString()
+	}
+
+	numOutputs := tp.UVarint()
+	op.Outputs = make([][]byte, numOutputs)
+	for i := 0; i < int(numOutputs); i++ {
+		op.Outputs[i] = tp.ByteString()
+	}
+
+	delete(tp.cacheMap, opID)
 	return nil
 }
 
@@ -923,6 +1213,56 @@ PCLoop:
 	return tr
 }
 
+func (tp *traceParser) formattedStack() *tracepb.StackTrace {
+	n := int(tp.Byte())
+	tr := &tracepb.StackTrace{}
+	if n == 0 {
+		return tr
+	}
+
+	tr.Frames = make([]*tracepb.StackFrame, 0, n)
+	for i := 0; i < n; i++ {
+		tr.Frames = append(tr.Frames, &tracepb.StackFrame{
+			Filename: tp.String(),
+			Line:     int32(tp.UVarint()),
+			Func:     tp.String(),
+		})
+	}
+
+	return tr
+}
+
+func (tp *traceParser) parseRequestType() (tracepb.Request_Type, error) {
+	switch b := tp.Byte(); b {
+	case 0x01:
+		return tracepb.Request_RPC, nil
+	case 0x02:
+		return tracepb.Request_AUTH, nil
+	case 0x03:
+		return tracepb.Request_PUBSUB_MSG, nil
+	default:
+		return -1, eerror.New("trace_parser", "unknown request type", map[string]any{"type": fmt.Sprintf("%x", b)})
+	}
+}
+
+func (tp *traceParser) parseTraceID() *tracepb.TraceID {
+	var traceID [16]byte
+	tp.Bytes(traceID[:])
+	return &tracepb.TraceID{
+		Low:  bin.Uint64(traceID[:8]),
+		High: bin.Uint64(traceID[8:]),
+	}
+}
+
+func (tp *traceParser) parseHTTPHeaders() map[string]string {
+	numHeaders := tp.UVarint()
+	h := make(map[string]string, numHeaders)
+	for i := uint64(0); i < numHeaders; i++ {
+		h[tp.String()] = tp.String()
+	}
+	return h
+}
+
 var bin = binary.LittleEndian
 
 type traceReader struct {
@@ -975,6 +1315,9 @@ func (tr *traceReader) String() string {
 
 func (tr *traceReader) ByteString() []byte {
 	size := tr.UVarint()
+	if (size) == 0 {
+		return nil
+	}
 	b := make([]byte, int(size))
 	tr.Bytes(b)
 	return b

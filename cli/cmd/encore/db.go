@@ -12,7 +12,10 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
+	"encr.dev/cli/cmd/encore/cmdutil"
 	"encr.dev/cli/daemon/sqldb/docker"
 	daemonpb "encr.dev/proto/encore/daemon"
 )
@@ -22,46 +25,77 @@ var dbCmd = &cobra.Command{
 	Short: "Database management commands",
 }
 
-var resetAll bool
+var (
+	resetAll  bool
+	testDB    bool
+	shadowDB  bool
+	write     bool
+	admin     bool
+	superuser bool
+	nsName    string
+)
+
+func getDBRole() daemonpb.DBRole {
+	switch {
+	case superuser:
+		return daemonpb.DBRole_DB_ROLE_SUPERUSER
+	case admin:
+		return daemonpb.DBRole_DB_ROLE_ADMIN
+	case write:
+		return daemonpb.DBRole_DB_ROLE_WRITE
+	default:
+		return daemonpb.DBRole_DB_ROLE_READ
+	}
+}
 
 var dbResetCmd = &cobra.Command{
-	Use:   "reset [service-names...]",
-	Short: "Resets the databases for the given services. Use --all to reset all databases.",
+	Use:   "reset <database-names...|--all>",
+	Short: "Resets the databases with the given names. Use --all to reset all databases.",
 
 	Run: func(command *cobra.Command, args []string) {
 		appRoot, _ := determineAppRoot()
-		svcNames := args
+		dbNames := args
 		if resetAll {
-			if len(svcNames) > 0 {
-				fatal("cannot specify both --all and service names")
+			if len(dbNames) > 0 {
+				fatal("cannot specify both --all and database names")
 			}
-			svcNames = nil
+			dbNames = nil
 		} else {
-			if len(svcNames) == 0 {
-				fatal("no service names given")
+			if len(dbNames) == 0 {
+				fatal("no database names given")
 			}
 		}
 
 		ctx := context.Background()
 		daemon := setupDaemon(ctx)
 		stream, err := daemon.DBReset(ctx, &daemonpb.DBResetRequest{
-			AppRoot:  appRoot,
-			Services: svcNames,
+			AppRoot:       appRoot,
+			DatabaseNames: dbNames,
+			ClusterType:   dbClusterType(),
+			Namespace:     nonZeroPtr(nsName),
 		})
 		if err != nil {
 			fatal("reset databases: ", err)
 		}
-		os.Exit(streamCommandOutput(stream, false))
+		os.Exit(cmdutil.StreamCommandOutput(stream, nil))
 	},
 }
 
 var dbEnv string
 
 var dbShellCmd = &cobra.Command{
-	Use:   "shell SERVICE_NAME [--env=local]",
+	Use:   "shell DATABASE_NAME [--env=<name>] [--test|--shadow]",
 	Short: "Connects to the database via psql shell",
-	Long:  "Defaults to connecting to your local environment. Specify --env to connect to another environment.",
-	Args:  cobra.MaximumNArgs(1),
+	Long: `Defaults to connecting to your local environment.
+Specify --env to connect to another environment.
+
+Use --test to connect to databases used for integration testing.
+Use --shadow to connect to the shadow database, used for database drift detection
+when using tools like Prisma.
+
+--test and --shadow imply --env=local.
+`,
+	Args: cobra.MaximumNArgs(1),
 
 	DisableFlagsInUseLine: true,
 	Run: func(command *cobra.Command, args []string) {
@@ -88,14 +122,21 @@ var dbShellCmd = &cobra.Command{
 			}
 			if dbName == "" {
 				fatal("could not find an Encore service with a database in this directory (or any of the parent directories).\n\n" +
-					"Note: You can specify a service name to connect to it directly using the command 'encore db shell <service-name>'.")
+					"Note: You can specify a service name to connect to it directly using the command 'encore db shell <database-name>'.")
 			}
 		}
 
+		if testDB || shadowDB {
+			dbEnv = "local"
+		}
+
 		resp, err := daemon.DBConnect(ctx, &daemonpb.DBConnectRequest{
-			AppRoot: appRoot,
-			DbName:  dbName,
-			EnvName: dbEnv,
+			AppRoot:     appRoot,
+			DbName:      dbName,
+			EnvName:     dbEnv,
+			ClusterType: dbClusterType(),
+			Namespace:   nonZeroPtr(nsName),
+			Role:        getDBRole(),
 		})
 		if err != nil {
 			fatalf("could not connect to the database for service %s: %v", dbName, err)
@@ -143,8 +184,16 @@ var dbShellCmd = &cobra.Command{
 var dbProxyPort int32
 
 var dbProxyCmd = &cobra.Command{
-	Use:   "proxy [--env=<name>]",
+	Use:   "proxy [--env=<name>] [--test|--shadow]",
 	Short: "Sets up a proxy tunnel to the database",
+	Long: `Set up a proxy tunnel to a database for use with other tools.
+
+Use --test to connect to databases used for integration testing.
+Use --shadow to connect to the shadow database, used for database drift detection
+when using tools like Prisma.
+
+--test and --shadow imply --env=local.
+`,
 
 	Run: func(command *cobra.Command, args []string) {
 		appRoot, _ := determineAppRoot()
@@ -157,23 +206,38 @@ var dbProxyCmd = &cobra.Command{
 			cancel()
 		}()
 
+		if testDB || shadowDB {
+			dbEnv = "local"
+		}
+
 		daemon := setupDaemon(ctx)
 		stream, err := daemon.DBProxy(ctx, &daemonpb.DBProxyRequest{
-			AppRoot: appRoot,
-			EnvName: dbEnv,
-			Port:    dbProxyPort,
+			AppRoot:     appRoot,
+			EnvName:     dbEnv,
+			Port:        dbProxyPort,
+			ClusterType: dbClusterType(),
+			Namespace:   nonZeroPtr(nsName),
+			Role:        getDBRole(),
 		})
 		if err != nil {
 			log.Fatal().Err(err).Msg("could not setup db proxy")
 		}
-		os.Exit(streamCommandOutput(stream, false))
+		os.Exit(cmdutil.StreamCommandOutput(stream, nil))
 	},
 }
 
 var dbConnURICmd = &cobra.Command{
-	Use:   "conn-uri [servicename]",
+	Use:   "conn-uri [<db-name>] [--test|--shadow]",
 	Short: "Outputs the database connection string",
-	Args:  cobra.MaximumNArgs(1),
+	Long: `Retrieve a stable connection uri for connecting to a database.
+
+Use --test to connect to databases used for integration testing.
+Use --shadow to connect to the shadow database, used for database drift detection
+when using tools like Prisma.
+
+--test and --shadow imply --env=local.
+`,
+	Args: cobra.MaximumNArgs(1),
 
 	Run: func(command *cobra.Command, args []string) {
 		appRoot, relPath := determineAppRoot()
@@ -201,32 +265,83 @@ var dbConnURICmd = &cobra.Command{
 			}
 		}
 
+		if testDB || shadowDB {
+			dbEnv = "local"
+		}
+
 		resp, err := daemon.DBConnect(ctx, &daemonpb.DBConnectRequest{
-			AppRoot: appRoot,
-			DbName:  dbName,
-			EnvName: dbEnv,
+			AppRoot:     appRoot,
+			DbName:      dbName,
+			EnvName:     dbEnv,
+			ClusterType: dbClusterType(),
+			Namespace:   nonZeroPtr(nsName),
+			Role:        getDBRole(),
 		})
 		if err != nil {
+			st, ok := status.FromError(err)
+			if ok {
+				if st.Code() == codes.NotFound {
+					fatalf("no such database found: %s", dbName)
+				}
+			}
 			fatalf("could not connect to the database for service %s: %v", dbName, err)
 		}
 
-		fmt.Fprintln(os.Stdout, resp.Dsn)
+		_, _ = fmt.Fprintln(os.Stdout, resp.Dsn)
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(dbCmd)
 
+	dbResetCmd.Flags().StringVarP(&nsName, "namespace", "n", "", "Namespace to use (defaults to active namespace)")
 	dbResetCmd.Flags().BoolVar(&resetAll, "all", false, "Reset all services in the application")
+	dbResetCmd.Flags().BoolVarP(&testDB, "test", "t", false, "Reset databases in the test cluster instead")
+	dbResetCmd.Flags().BoolVar(&shadowDB, "shadow", false, "Reset databases in the shadow cluster instead")
 	dbCmd.AddCommand(dbResetCmd)
 
+	dbShellCmd.Flags().StringVarP(&nsName, "namespace", "n", "", "Namespace to use (defaults to active namespace)")
 	dbShellCmd.Flags().StringVarP(&dbEnv, "env", "e", "local", "Environment name to connect to (such as \"prod\")")
+	dbShellCmd.Flags().BoolVarP(&testDB, "test", "t", false, "Connect to the integration test database (implies --env=local)")
+	dbShellCmd.Flags().BoolVar(&shadowDB, "shadow", false, "Connect to the shadow database (implies --env=local)")
+	dbShellCmd.Flags().BoolVar(&write, "write", false, "Connect with write privileges")
+	dbShellCmd.Flags().BoolVar(&admin, "admin", false, "Connect with admin privileges")
+	dbShellCmd.Flags().BoolVar(&superuser, "superuser", false, "Connect as a superuser")
+	dbShellCmd.MarkFlagsMutuallyExclusive("write", "admin", "superuser")
 	dbCmd.AddCommand(dbShellCmd)
 
+	dbProxyCmd.Flags().StringVarP(&nsName, "namespace", "n", "", "Namespace to use (defaults to active namespace)")
 	dbProxyCmd.Flags().StringVarP(&dbEnv, "env", "e", "local", "Environment name to connect to (such as \"prod\")")
 	dbProxyCmd.Flags().Int32VarP(&dbProxyPort, "port", "p", 0, "Port to listen on (defaults to a random port)")
+	dbProxyCmd.Flags().BoolVarP(&testDB, "test", "t", false, "Connect to the integration test database (implies --env=local)")
+	dbProxyCmd.Flags().BoolVar(&shadowDB, "shadow", false, "Connect to the shadow database (implies --env=local)")
+	dbProxyCmd.Flags().BoolVar(&write, "write", false, "Connect with write privileges")
+	dbProxyCmd.Flags().BoolVar(&admin, "admin", false, "Connect with admin privileges")
+	dbProxyCmd.Flags().BoolVar(&superuser, "superuser", false, "Connect as a superuser")
+	dbProxyCmd.MarkFlagsMutuallyExclusive("write", "admin", "superuser")
 	dbCmd.AddCommand(dbProxyCmd)
 
+	dbConnURICmd.Flags().StringVarP(&nsName, "namespace", "n", "", "Namespace to use (defaults to active namespace)")
 	dbConnURICmd.Flags().StringVarP(&dbEnv, "env", "e", "local", "Environment name to connect to (such as \"prod\")")
+	dbConnURICmd.Flags().BoolVarP(&testDB, "test", "t", false, "Connect to the integration test database (implies --env=local)")
+	dbConnURICmd.Flags().BoolVar(&shadowDB, "shadow", false, "Connect to the shadow database (implies --env=local)")
+	dbConnURICmd.Flags().BoolVar(&write, "write", false, "Connect with write privileges")
+	dbConnURICmd.Flags().BoolVar(&admin, "admin", false, "Connect with admin privileges")
+	dbConnURICmd.Flags().BoolVar(&superuser, "superuser", false, "Connect as a superuser")
+	dbConnURICmd.MarkFlagsMutuallyExclusive("write", "admin", "superuser")
 	dbCmd.AddCommand(dbConnURICmd)
+}
+
+func dbClusterType() daemonpb.DBClusterType {
+	if testDB && shadowDB {
+		fatal("cannot specify both --test and --shadow")
+	}
+	switch {
+	case testDB:
+		return daemonpb.DBClusterType_DB_CLUSTER_TYPE_TEST
+	case shadowDB:
+		return daemonpb.DBClusterType_DB_CLUSTER_TYPE_SHADOW
+	default:
+		return daemonpb.DBClusterType_DB_CLUSTER_TYPE_RUN
+	}
 }

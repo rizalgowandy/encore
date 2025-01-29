@@ -1,0 +1,398 @@
+---
+source: tsparser/src/parser/types/tests.rs
+expression: result
+input_file: tsparser/src/parser/types/testdata/basic.ts
+---
+{
+    "Interface": Interface(
+        Interface {
+            fields: [
+                InterfaceField {
+                    name: String(
+                        "foo",
+                    ),
+                    optional: false,
+                    typ: Basic(
+                        String,
+                    ),
+                },
+                InterfaceField {
+                    name: String(
+                        "bar",
+                    ),
+                    optional: false,
+                    typ: Basic(
+                        Number,
+                    ),
+                },
+                InterfaceField {
+                    name: String(
+                        "optional",
+                    ),
+                    optional: true,
+                    typ: Basic(
+                        Boolean,
+                    ),
+                },
+            ],
+            index: None,
+            call: None,
+        },
+    ),
+    "Exclude1": Union(
+        Union {
+            types: [
+                Literal(
+                    String(
+                        "bar",
+                    ),
+                ),
+                Literal(
+                    String(
+                        "optional",
+                    ),
+                ),
+            ],
+        },
+    ),
+    "Pick1": Interface(
+        Interface {
+            fields: [
+                InterfaceField {
+                    name: String(
+                        "foo",
+                    ),
+                    optional: false,
+                    typ: Basic(
+                        String,
+                    ),
+                },
+            ],
+            index: None,
+            call: None,
+        },
+    ),
+    "Pick2": Interface(
+        Interface {
+            fields: [
+                InterfaceField {
+                    name: String(
+                        "foo",
+                    ),
+                    optional: false,
+                    typ: Basic(
+                        String,
+                    ),
+                },
+                InterfaceField {
+                    name: String(
+                        "optional",
+                    ),
+                    optional: true,
+                    typ: Basic(
+                        Boolean,
+                    ),
+                },
+            ],
+            index: None,
+            call: None,
+        },
+    ),
+    "Omit1": Interface(
+        Interface {
+            fields: [
+                InterfaceField {
+                    name: String(
+                        "bar",
+                    ),
+                    optional: false,
+                    typ: Basic(
+                        Number,
+                    ),
+                },
+                InterfaceField {
+                    name: String(
+                        "optional",
+                    ),
+                    optional: true,
+                    typ: Basic(
+                        Boolean,
+                    ),
+                },
+            ],
+            index: None,
+            call: None,
+        },
+    ),
+    "Omit2": Interface(
+        Interface {
+            fields: [
+                InterfaceField {
+                    name: String(
+                        "optional",
+                    ),
+                    optional: true,
+                    typ: Basic(
+                        Boolean,
+                    ),
+                },
+            ],
+            index: None,
+            call: None,
+        },
+    ),
+    "Partial1": Interface(
+        Interface {
+            fields: [
+                InterfaceField {
+                    name: String(
+                        "foo",
+                    ),
+                    optional: true,
+                    typ: Basic(
+                        String,
+                    ),
+                },
+                InterfaceField {
+                    name: String(
+                        "bar",
+                    ),
+                    optional: true,
+                    typ: Basic(
+                        Number,
+                    ),
+                },
+                InterfaceField {
+                    name: String(
+                        "optional",
+                    ),
+                    optional: true,
+                    typ: Basic(
+                        Boolean,
+                    ),
+                },
+            ],
+            index: None,
+            call: None,
+        },
+    ),
+    "Index": Interface(
+        Interface {
+            fields: [],
+            index: Some(
+                (
+                    Basic(
+                        String,
+                    ),
+                    Union(
+                        Union {
+                            types: [
+                                Basic(
+                                    Boolean,
+                                ),
+                                Basic(
+                                    Number,
+                                ),
+                            ],
+                        },
+                    ),
+                ),
+            ),
+            call: None,
+        },
+    ),
+    "Intersect1": Interface(
+        Interface {
+            fields: [
+                InterfaceField {
+                    name: String(
+                        "foo",
+                    ),
+                    optional: false,
+                    typ: Basic(
+                        String,
+                    ),
+                },
+                InterfaceField {
+                    name: String(
+                        "bar",
+                    ),
+                    optional: false,
+                    typ: Basic(
+                        Number,
+                    ),
+                },
+            ],
+            index: None,
+            call: None,
+        },
+    ),
+    "Intersect2": Interface(
+        Interface {
+            fields: [
+                InterfaceField {
+                    name: String(
+                        "foo",
+                    ),
+                    optional: false,
+                    typ: Literal(
+                        String(
+                            "literal",
+                        ),
+                    ),
+                },
+            ],
+            index: None,
+            call: None,
+        },
+    ),
+    "Intersect3": Interface(
+        Interface {
+            fields: [
+                InterfaceField {
+                    name: String(
+                        "foo",
+                    ),
+                    optional: false,
+                    typ: Basic(
+                        Never,
+                    ),
+                },
+            ],
+            index: None,
+            call: None,
+        },
+    ),
+    "Intersect4": Interface(
+        Interface {
+            fields: [
+                InterfaceField {
+                    name: String(
+                        "foo",
+                    ),
+                    optional: false,
+                    typ: Literal(
+                        String(
+                            "optional",
+                        ),
+                    ),
+                },
+            ],
+            index: None,
+            call: None,
+        },
+    ),
+    "Intersect5": Interface(
+        Interface {
+            fields: [
+                InterfaceField {
+                    name: String(
+                        "a",
+                    ),
+                    optional: false,
+                    typ: Basic(
+                        Any,
+                    ),
+                },
+                InterfaceField {
+                    name: String(
+                        "b",
+                    ),
+                    optional: false,
+                    typ: Basic(
+                        String,
+                    ),
+                },
+                InterfaceField {
+                    name: String(
+                        "c",
+                    ),
+                    optional: false,
+                    typ: Basic(
+                        Never,
+                    ),
+                },
+            ],
+            index: None,
+            call: None,
+        },
+    ),
+    "Enum1": Enum(
+        EnumType {
+            members: [
+                EnumMember {
+                    name: "A",
+                    value: Number(
+                        0,
+                    ),
+                },
+                EnumMember {
+                    name: "B",
+                    value: Number(
+                        1,
+                    ),
+                },
+                EnumMember {
+                    name: "C",
+                    value: Number(
+                        2,
+                    ),
+                },
+                EnumMember {
+                    name: "D",
+                    value: String(
+                        "foo",
+                    ),
+                },
+                EnumMember {
+                    name: "E",
+                    value: Number(
+                        5,
+                    ),
+                },
+                EnumMember {
+                    name: "F",
+                    value: Number(
+                        6,
+                    ),
+                },
+            ],
+        },
+    ),
+    "EnumFields": Union(
+        Union {
+            types: [
+                Literal(
+                    String(
+                        "A",
+                    ),
+                ),
+                Literal(
+                    String(
+                        "B",
+                    ),
+                ),
+                Literal(
+                    String(
+                        "C",
+                    ),
+                ),
+                Literal(
+                    String(
+                        "D",
+                    ),
+                ),
+                Literal(
+                    String(
+                        "E",
+                    ),
+                ),
+                Literal(
+                    String(
+                        "F",
+                    ),
+                ),
+            ],
+        },
+    ),
+}

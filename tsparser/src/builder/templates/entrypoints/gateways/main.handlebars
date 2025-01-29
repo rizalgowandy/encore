@@ -1,0 +1,18 @@
+import { registerGateways, run } from "encore.dev/internal/codegen/appinit";
+import { Worker, isMainThread } from "node:worker_threads";
+import { fileURLToPath } from "node:url";
+import { availableParallelism } from "node:os";
+
+{{#each gateways}}
+import { {{bind_name}} as {{encoreNameToIdent encore_name}}Impl } from {{toJSON import_path}};
+{{/each}}
+
+const gateways = [
+{{#each gateways}}
+    {{encoreNameToIdent encore_name}}Impl,
+{{/each}}
+];
+
+registerGateways(gateways);
+
+await run(import.meta.url);

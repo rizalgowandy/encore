@@ -4,17 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v4"
+	"github.com/cockroachdb/errors"
+	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog"
 
+	"encr.dev/cli/daemon/namespace"
 	"encr.dev/cli/daemon/sqldb"
+	"encr.dev/pkg/idents"
 )
 
 type Driver struct{}
@@ -25,6 +28,7 @@ const (
 	DefaultSuperuserUsername = "postgres"
 	DefaultSuperuserPassword = "postgres"
 	DefaultRootDatabase      = "postgres"
+	defaultDataDir           = "/var/lib/postgresql/data"
 )
 
 func (d *Driver) CreateCluster(ctx context.Context, p *sqldb.CreateParams, log zerolog.Logger) (status *sqldb.ClusterStatus, err error) {
@@ -33,12 +37,17 @@ func (d *Driver) CreateCluster(ctx context.Context, p *sqldb.CreateParams, log z
 		checkExistsCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if ok, err := ImageExists(checkExistsCtx); err != nil {
-			return nil, fmt.Errorf("check docker image: %v", err)
+			return nil, errors.Wrap(err, "check docker image")
 		} else if !ok {
 			log.Debug().Msg("PostgreSQL image does not exist, pulling")
+			pullOp := p.Tracker.Add("Pulling PostgreSQL docker image", time.Now())
 			if err := PullImage(context.Background()); err != nil {
 				log.Error().Err(err).Msg("failed to pull PostgreSQL image")
-				return nil, fmt.Errorf("pull docker image: %v", err)
+				p.Tracker.Fail(pullOp, err)
+				return nil, errors.Wrap(err, "pull docker image")
+			} else {
+				p.Tracker.Done(pullOp, 0)
+				log.Info().Msg("successfully pulled sqldb image")
 			}
 		}
 	}
@@ -54,17 +63,28 @@ func (d *Driver) CreateCluster(ctx context.Context, p *sqldb.CreateParams, log z
 		// Wait for the database to come up; this might take a little bit
 		// when we're racing with spinning up a Docker container.
 		uri := status.ConnURI(status.Config.RootDatabase, status.Config.Superuser)
-		for i := 0; i < 40; i++ {
+
+		const sleepTime = 250 * time.Millisecond
+		const maxLoops = (30 * time.Second) / sleepTime
+		for i := 0; i < int(maxLoops); i++ {
 			var conn *pgx.Conn
-			conn, err = pgx.Connect(ctx, uri)
+			connCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			conn, err = pgx.Connect(connCtx, uri)
+			cancel()
+
 			if err == nil {
-				conn.Close(ctx)
+				_ = conn.Close(ctx)
 				return
 			} else if ctx.Err() != nil {
 				// We'll never succeed once the context has been canceled.
 				// Give up straight away.
 				log.Debug().Err(err).Msgf("failed to connect to db")
-				err = fmt.Errorf("database did not come up: %v", err)
+				err = errors.Wrap(err, "database did not come up")
+			} else if errors.Is(err, io.ErrUnexpectedEOF) {
+				// This is a transient error that can happen when the database first initialises
+				err = errors.Wrap(err, "database is not ready yet")
+			} else {
+				err = errors.WithStack(err)
 			}
 			time.Sleep(250 * time.Millisecond)
 		}
@@ -75,7 +95,7 @@ func (d *Driver) CreateCluster(ctx context.Context, p *sqldb.CreateParams, log z
 	status, existingContainerName, err := d.clusterStatus(ctx, cid)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to get container status")
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 
 	// waitForPort waits for the port to become available before returning.
@@ -83,7 +103,7 @@ func (d *Driver) CreateCluster(ctx context.Context, p *sqldb.CreateParams, log z
 		for i := 0; i < 20; i++ {
 			status, err = d.ClusterStatus(ctx, cid)
 			if err != nil {
-				return nil, err
+				return nil, errors.Wrap(err, "unable to wait for port")
 			}
 			if status.Config.Host != "" {
 				log.Debug().Str("hostport", status.Config.Host).Msg("cluster started")
@@ -91,7 +111,7 @@ func (d *Driver) CreateCluster(ctx context.Context, p *sqldb.CreateParams, log z
 			}
 			time.Sleep(500 * time.Millisecond)
 		}
-		return nil, fmt.Errorf("timed out waiting for cluster to start")
+		return nil, errors.New("timed out waiting for cluster to start")
 	}
 
 	switch status.Status {
@@ -103,7 +123,7 @@ func (d *Driver) CreateCluster(ctx context.Context, p *sqldb.CreateParams, log z
 		log.Debug().Msg("cluster stopped, restarting")
 
 		if out, err := exec.CommandContext(ctx, "docker", "start", existingContainerName).CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("could not start sqldb container: %s (%v)", string(out), err)
+			return nil, errors.Wrapf(err, "could not start sqldb container: %s", string(out))
 		}
 		return waitForPort()
 
@@ -117,34 +137,50 @@ func (d *Driver) CreateCluster(ctx context.Context, p *sqldb.CreateParams, log z
 			"-e", "POSTGRES_USER=" + DefaultSuperuserUsername,
 			"-e", "POSTGRES_PASSWORD=" + DefaultSuperuserPassword,
 			"-e", "POSTGRES_DB=" + DefaultRootDatabase,
+			"-e", "PGDATA=" + defaultDataDir,
 			"--name", cnames[0],
 		}
 		if p.Memfs {
 			args = append(args,
-				"--mount", "type=tmpfs,destination=/var/lib/postgresql/data",
+				"--mount", "type=tmpfs,destination="+defaultDataDir,
 				Image,
 				"-c", "fsync=off",
 			)
 		} else {
-			args = append(args, Image)
+			volumeName := clusterVolumeNames(p.ClusterID.NS)[0] // guaranteed to be non-empty
+			if err := d.createVolumeIfNeeded(ctx, volumeName); err != nil {
+				return nil, errors.Wrap(err, "create data volume")
+			}
+			args = append(args,
+				"-v", fmt.Sprintf("%s:%s", volumeName, defaultDataDir),
+				Image)
 		}
 
 		cmd := exec.CommandContext(ctx, "docker", args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("could not start sql database as docker container: %s: %v", out, err)
+			return nil, errors.Wrapf(err, "could not start sql database as docker container: %s", out)
 		}
 
 		log.Debug().Msg("cluster created")
 		return waitForPort()
 
 	default:
-		return nil, fmt.Errorf("unknown cluster status %q", status.Status)
+		return nil, errors.Newf("unknown cluster status %q", status.Status)
 	}
 }
 
 func (d *Driver) ClusterStatus(ctx context.Context, id sqldb.ClusterID) (*sqldb.ClusterStatus, error) {
 	status, _, err := d.clusterStatus(ctx, id)
-	return status, err
+	return status, errors.WithStack(err)
+}
+
+func (d *Driver) CheckRequirements(ctx context.Context) error {
+	if _, err := exec.LookPath("docker"); err != nil {
+		return errors.New("This application requires docker to run since it uses an SQL database. Install docker first.")
+	} else if !isDockerRunning(ctx) {
+		return errors.New("The docker daemon is not running. Start it first.")
+	}
+	return nil
 }
 
 // clusterStatus reports both the standard ClusterStatus but also the container name we actually resolved to.
@@ -156,7 +192,7 @@ func (d *Driver) clusterStatus(ctx context.Context, id sqldb.ClusterID) (status 
 	for _, cname := range cnames {
 		var err error
 		out, err := exec.CommandContext(ctx, "docker", "container", "inspect", cname).CombinedOutput()
-		if err == exec.ErrNotFound {
+		if errors.Is(err, exec.ErrNotFound) {
 			return nil, "", errors.New("docker not found: is it installed and in your PATH?")
 		} else if err != nil {
 			// Docker returns a non-zero exit code if the container does not exist.
@@ -164,7 +200,11 @@ func (d *Driver) clusterStatus(ctx context.Context, id sqldb.ClusterID) (status 
 			if bytes.Contains(out, []byte("No such container")) {
 				continue
 			}
-			return nil, "", fmt.Errorf("docker container inspect failed: %s (%v)", out, err)
+			// Podman has slightly different output when a container is not found.
+			if bytes.Contains(out, []byte("no such container")) {
+				continue
+			}
+			return nil, "", errors.Wrapf(err, "docker container inspect failed: %s", out)
 		} else {
 			// Found our container; use it.
 			output, containerName = out, cname
@@ -191,10 +231,11 @@ func (d *Driver) clusterStatus(ctx context.Context, id sqldb.ClusterID) (status 
 		}
 	}
 	if err := json.Unmarshal(output, &resp); err != nil {
-		return nil, "", fmt.Errorf("parse `docker container inspect` response: %v", err)
+		return nil, "", errors.Wrap(err, "parse `docker container inspect` response")
 	}
 	for _, c := range resp {
-		if c.Name == "/"+containerName {
+		// Docker prefixes `/` to the container name, Podman doesn't.
+		if c.Name == "/"+containerName || c.Name == containerName {
 			status := &sqldb.ClusterStatus{Status: sqldb.Stopped, Config: &sqldb.ConnConfig{
 				// Defaults if we don't find anything else configured.
 				Superuser: sqldb.Role{
@@ -209,7 +250,15 @@ func (d *Driver) clusterStatus(ctx context.Context, id sqldb.ClusterID) (status 
 			}
 			ports := c.NetworkSettings.Ports["5432/tcp"]
 			if len(ports) > 0 {
-				status.Config.Host = ports[0].HostIP + ":" + ports[0].HostPort
+				hostIP := ports[0].HostIP
+
+				// Podman can keep HostIP empty or 0.0.0.0.
+				// https://github.com/containers/podman/issues/17780
+				if hostIP == "" || hostIP == "0.0.0.0" {
+					hostIP = "127.0.0.1"
+				}
+
+				status.Config.Host = hostIP + ":" + ports[0].HostPort
 			}
 
 			// Read the Postgres config from the docker container's environment.
@@ -232,6 +281,14 @@ func (d *Driver) clusterStatus(ctx context.Context, id sqldb.ClusterID) (status 
 	return &sqldb.ClusterStatus{Status: sqldb.NotFound}, containerName, nil
 }
 
+func (d *Driver) CanDestroyCluster(ctx context.Context, id sqldb.ClusterID) error {
+	// Check that we can communicate with Docker.
+	if !isDockerRunning(ctx) {
+		return errors.New("cannot delete sql database: docker is not running")
+	}
+	return nil
+}
+
 func (d *Driver) DestroyCluster(ctx context.Context, id sqldb.ClusterID) error {
 	cnames := containerNames(id)
 	for _, cname := range cnames {
@@ -240,28 +297,64 @@ func (d *Driver) DestroyCluster(ctx context.Context, id sqldb.ClusterID) error {
 			if bytes.Contains(out, []byte("No such container")) {
 				continue
 			}
-			return fmt.Errorf("could not delete cluster: %s (%v)", out, err)
+			return errors.Wrapf(err, "could not delete cluster: %s", out)
 		}
 	}
 	return nil
 }
 
+func (d *Driver) DestroyNamespaceData(ctx context.Context, ns *namespace.Namespace) error {
+	candidates := clusterVolumeNames(ns)
+	for _, c := range candidates {
+		if err := exec.CommandContext(ctx, "docker", "volume", "rm", "-f", c).Run(); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "no such volume") {
+				continue
+			}
+			return errors.Wrapf(err, "could not delete volume %s", c)
+		}
+	}
+	return nil
+}
+
+func (d *Driver) createVolumeIfNeeded(ctx context.Context, name string) error {
+	if err := exec.CommandContext(ctx, "docker", "volume", "inspect", name).Run(); err == nil {
+		return nil
+	}
+	out, err := exec.CommandContext(ctx, "docker", "volume", "create", name).CombinedOutput()
+	return errors.Wrapf(err, "create volume %s: %s", name, out)
+}
+
+func (d *Driver) Meta() sqldb.DriverMeta {
+	return sqldb.DriverMeta{ClusterIsolation: true}
+}
+
 // containerName computes the container name candidates for a given clusterID.
 func containerNames(id sqldb.ClusterID) []string {
-	var names []string
-	if pid := id.App.PlatformID(); pid != "" {
-		names = append(names, pid)
-	}
-	names = append(names, id.App.LocalID())
+	// candidates returns possible candidate names for a given app id.
+	candidates := func(appID string) (names []string) {
+		base := "sqldb-" + appID
 
-	// Format the names into container names
-	for i, name := range names {
-		name = "sqldb-" + name
 		if id.Type != sqldb.Run {
-			name += "-" + string(id.Type)
+			base += "-" + string(id.Type)
 		}
-		names[i] = name
+
+		// Convert the namespace to kebab case to remove invalid characters like ':'.
+		nsName := idents.Convert(string(id.NS.Name), idents.KebabCase)
+
+		names = []string{base + "-" + nsName + "-" + string(id.NS.ID)}
+		// If this is the default namespace look up the container without
+		// the namespace suffix as well, for backwards compatibility.
+		if id.NS.Name == "default" {
+			names = append(names, base)
+		}
+		return names
 	}
+
+	var names []string
+	if pid := id.NS.App.PlatformID(); pid != "" {
+		names = append(names, candidates(pid)...)
+	}
+	names = append(names, candidates(id.NS.App.LocalID())...)
 	return names
 }
 
@@ -273,8 +366,11 @@ func ImageExists(ctx context.Context) (ok bool, err error) {
 		return true, nil
 	case bytes.Contains(out, []byte("No such image")):
 		return false, nil
+	// Podman has a different error message.
+	case bytes.Contains(out, []byte("failed to find image")):
+		return false, nil
 	default:
-		return false, err
+		return false, errors.WithStack(errors.Wrapf(err, "docker image inspect failed: %s", Image))
 	}
 }
 
@@ -286,4 +382,22 @@ func PullImage(ctx context.Context) error {
 	return cmd.Run()
 }
 
-const Image = "postgres:14-alpine"
+const Image = "encoredotdev/postgres:15"
+
+func isDockerRunning(ctx context.Context) bool {
+	err := exec.CommandContext(ctx, "docker", "info").Run()
+	return err == nil
+}
+
+// clusterVolumeName reports the candidate names for the docker volume.
+func clusterVolumeNames(ns *namespace.Namespace) (candidates []string) {
+	nsName := idents.Convert(string(ns.Name), idents.KebabCase)
+	suffix := fmt.Sprintf("%s-%s", ns.ID, nsName)
+
+	for _, id := range [...]string{ns.App.PlatformID(), ns.App.LocalID()} {
+		if id != "" {
+			candidates = append(candidates, fmt.Sprintf("sqldb-%s-%s", id, suffix))
+		}
+	}
+	return candidates
+}

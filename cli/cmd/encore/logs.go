@@ -3,22 +3,26 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/signal"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/logrusorgru/aurora/v3"
 	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
 
-	"encr.dev/cli/internal/appfile"
 	"encr.dev/cli/internal/platform"
+	"encr.dev/pkg/appfile"
 )
 
 var (
-	logsEnv  string
-	logsJSON bool
+	logsEnv   string
+	logsJSON  bool
+	logsQuiet bool
 )
 
 var logsCmd = &cobra.Command{
@@ -42,6 +46,9 @@ func streamLogs(appRoot, envName string) {
 		fatal("app is not linked with Encore Cloud")
 	}
 
+	if envName == "" {
+		envName = "@primary"
+	}
 	logs, err := platform.EnvLogs(ctx, appSlug, envName)
 	if err != nil {
 		var e platform.Error
@@ -59,38 +66,12 @@ func streamLogs(appRoot, envName string) {
 		logs.Close()
 	}()
 
-	const (
-		// Time allowed to write a message to the peer.
-		writeWait = 10 * time.Second
-
-		// Time allowed to read the next pong message from the peer.
-		pongTimeout = 60 * time.Second
-
-		// Send pings to peer with this period. Must be less than pongWait.
-		pingPeriod = (pongTimeout * 9) / 10
-	)
-
-	pingTicker := time.NewTicker(pingPeriod)
-	defer func() {
-		pingTicker.Stop()
-		logs.Close()
-	}()
-
-	go func() {
-		defer logs.Close() // close the stream if we fail to ping the server.
-		for range pingTicker.C {
-			logs.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := logs.WriteMessage(websocket.PingMessage, nil); err != nil {
-				return
-			}
-		}
-	}()
-
-	logs.SetReadDeadline(time.Now().Add(pongTimeout))
-	logs.SetPongHandler(func(string) error { logs.SetReadDeadline(time.Now().Add(pongTimeout)); return nil })
-
 	// Use the same configuration as the runtime
 	zerolog.TimeFieldFormat = time.RFC3339Nano
+
+	if !logsQuiet {
+		fmt.Println(aurora.Gray(12, "Connected, waiting for logs..."))
+	}
 
 	cw := zerolog.NewConsoleWriter()
 	for {
@@ -106,7 +87,7 @@ func streamLogs(appRoot, envName string) {
 		for _, line := range lines {
 			// Pretty-print logs if requested and it looks like a JSON log line
 			if !logsJSON && bytes.HasPrefix(line, []byte{'{'}) {
-				if _, err := cw.Write(line); err != nil {
+				if _, err := cw.Write(mapCloudFieldNamesToExpected(line)); err != nil {
 					// Fall back to regular stdout in case of error
 					os.Stdout.Write(line)
 					os.Stdout.Write([]byte("\n"))
@@ -119,8 +100,41 @@ func streamLogs(appRoot, envName string) {
 	}
 }
 
+// mapCloudFieldNamesToExpected detects if we're logging with GCP style logging and then swaps
+// the field names to what is expected by zerolog
+func mapCloudFieldNamesToExpected(jsonBytes []byte) []byte {
+	unmarshaled := map[string]any{}
+	err := json.Unmarshal(jsonBytes, &unmarshaled)
+	if err != nil {
+		return jsonBytes
+	}
+
+	_, hasSeverity := unmarshaled["severity"]
+	_, hasExpectedLevelField := unmarshaled[zerolog.LevelFieldName]
+	_, hasTimestamp := unmarshaled["timestamp"]
+	_, hasExpectedTimeField := unmarshaled[zerolog.TimestampFieldName]
+
+	// GCP logs have a severity field and a timestamp field and not the default level and timestamp
+	if hasSeverity && !hasExpectedLevelField && hasTimestamp && !hasExpectedTimeField {
+		unmarshaled[zerolog.LevelFieldName] = unmarshaled["severity"]
+		delete(unmarshaled, "severity")
+		unmarshaled[zerolog.TimestampFieldName] = unmarshaled["timestamp"]
+		delete(unmarshaled, "timestamp")
+	} else {
+		// No changes, return the original bytes unmodified
+		return jsonBytes
+	}
+
+	newBytes, err := json.Marshal(unmarshaled)
+	if err != nil {
+		return jsonBytes
+	}
+	return newBytes
+}
+
 func init() {
 	rootCmd.AddCommand(logsCmd)
-	logsCmd.Flags().StringVarP(&logsEnv, "env", "e", "", "Environment name to stream logs from (defaults to the production environment)")
+	logsCmd.Flags().StringVarP(&logsEnv, "env", "e", "", "Environment name to stream logs from (defaults to the primary environment)")
 	logsCmd.Flags().BoolVar(&logsJSON, "json", false, "Whether to print logs in raw JSON format")
+	logsCmd.Flags().BoolVarP(&logsQuiet, "quiet", "q", false, "Whether to print initial message when the command is waiting for logs")
 }

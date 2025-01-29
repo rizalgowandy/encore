@@ -2,43 +2,56 @@ package dash
 
 import (
 	"context"
-	"embed"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"net/http"
-	"path/filepath"
-	"strings"
+	"net/http/httputil"
 	"sync"
 
 	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog/log"
 
-	"encr.dev/cli/daemon/engine/trace"
+	"encr.dev/cli/daemon/apps"
+	"encr.dev/cli/daemon/dash/ai"
+	"encr.dev/cli/daemon/dash/apiproxy"
+	"encr.dev/cli/daemon/dash/dashproxy"
+	"encr.dev/cli/daemon/engine/trace2"
+	"encr.dev/cli/daemon/namespace"
 	"encr.dev/cli/daemon/run"
 	"encr.dev/cli/internal/jsonrpc2"
+	"encr.dev/internal/conf"
+	"encr.dev/pkg/fns"
 )
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(*http.Request) bool { return true },
 }
 
-//go:embed dashapp/dist/*
-var assets embed.FS
-
 // NewServer starts a new server and returns it.
-func NewServer(runMgr *run.Manager, tr *trace.Store) *Server {
-	assets, err := fs.Sub(assets, "dashapp/dist")
+func NewServer(appsMgr *apps.Manager, runMgr *run.Manager, nsMgr *namespace.Manager, tr trace2.Store, dashPort int) *Server {
+	proxy, err := dashproxy.New(conf.DevDashURL)
 	if err != nil {
-		log.Fatal().Err(err).Msg("could not get dash assets")
+		log.Fatal().Err(err).Msg("could not create dash proxy")
 	}
 
+	apiProxy, err := apiproxy.New(conf.APIBaseURL + "/graphql")
+	if err != nil {
+		log.Fatal().Err(err).Msg("could not create graphql proxy")
+	}
+
+	aiMgr := ai.NewAIManager()
+
 	s := &Server{
-		run:     runMgr,
-		tr:      tr,
-		assets:  assets,
-		traceCh: make(chan *trace.TraceMeta, 10),
-		clients: make(map[chan<- *notification]struct{}),
+		proxy:    proxy,
+		apiProxy: apiProxy,
+		apps:     appsMgr,
+		run:      runMgr,
+		ns:       nsMgr,
+		tr:       tr,
+		dashPort: dashPort,
+		traceCh:  make(chan trace2.NewSpanEvent, 10),
+		clients:  make(map[chan<- *notification]struct{}),
+		ai:       aiMgr,
 	}
 
 	runMgr.AddListener(s)
@@ -49,32 +62,28 @@ func NewServer(runMgr *run.Manager, tr *trace.Store) *Server {
 
 // Server is the http.Handler for serving the developer dashboard.
 type Server struct {
-	run     *run.Manager
-	tr      *trace.Store
-	traceCh chan *trace.TraceMeta
-	assets  fs.FS
+	proxy    *httputil.ReverseProxy
+	apiProxy *httputil.ReverseProxy
+	apps     *apps.Manager
+	run      *run.Manager
+	ns       *namespace.Manager
+	tr       trace2.Store
+	dashPort int
+	traceCh  chan trace2.NewSpanEvent
+	ai       *ai.Manager
 
 	mu      sync.Mutex
 	clients map[chan<- *notification]struct{}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	path := req.URL.Path
-	fs := http.FileServer(http.FS(s.assets))
-	switch {
-	case path == "/__encore":
+	switch req.URL.Path {
+	case "/__encore":
 		s.WebSocket(w, req)
-	case strings.HasPrefix(path, "/assets/") || path == "/favicon.ico":
-		// We've seen cases where net/http's content type detection gets it wrong
-		// for the bundled javascript files. Work around it by specifying it manually.
-		if filepath.Ext(path) == ".js" {
-			w.Header().Set("Content-Type", "application/javascript")
-		}
-		fs.ServeHTTP(w, req)
+	case "/__graphql":
+		s.apiProxy.ServeHTTP(w, req)
 	default:
-		// Serve the index page for all other paths since we use client-side routing.
-		req.URL.Path = "/"
-		fs.ServeHTTP(w, req)
+		s.proxy.ServeHTTP(w, req)
 	}
 }
 
@@ -85,17 +94,19 @@ func (s *Server) WebSocket(w http.ResponseWriter, req *http.Request) {
 		log.Error().Err(err).Msg("dash: could not upgrade websocket")
 		return
 	}
-	defer c.Close()
+	defer fns.CloseIgnore(c)
 	log.Info().Msg("dash: websocket connection established")
 
 	stream := &wsStream{c: c}
 	conn := jsonrpc2.NewConn(stream)
-	handler := &handler{rpc: conn, run: s.run, tr: s.tr}
+	handler := &handler{rpc: conn, apps: s.apps, run: s.run, ns: s.ns, tr: s.tr, ai: s.ai}
 	conn.Go(req.Context(), handler.Handle)
 
 	ch := make(chan *notification, 20)
 	s.addClient(ch)
 	defer s.removeClient(ch)
+
+	// nosemgrep: tools.semgrep-rules.semgrep-go.http-request-go-context
 	go handler.listenNotify(req.Context(), ch)
 
 	<-conn.Done()
@@ -120,11 +131,19 @@ func (s *Server) removeClient(ch chan *notification) {
 	delete(s.clients, ch)
 }
 
+// hasClients reports whether there are any active clients.
+func (s *Server) hasClients() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.clients) > 0
+}
+
 type notification struct {
 	Method string
 	Params interface{}
 }
 
+// notify notifies any active clients.
 func (s *Server) notify(n *notification) {
 	var clients []chan<- *notification
 	s.mu.Lock()

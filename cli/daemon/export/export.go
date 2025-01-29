@@ -1,72 +1,201 @@
 package export
 
 import (
-	"archive/tar"
-	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"os"
 	"time"
 
 	"github.com/cockroachdb/errors"
-	"github.com/containerd/stargz-snapshotter/estargz"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/daemon"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
-	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
-	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/rs/zerolog"
 
-	"encr.dev/cli/internal/env"
-	"encr.dev/cli/internal/version"
-	"encr.dev/compiler"
+	"encr.dev/cli/daemon/apps"
+	"encr.dev/internal/env"
+	"encr.dev/internal/version"
+	"encr.dev/pkg/appfile"
+	"encr.dev/pkg/builder"
+	"encr.dev/pkg/builder/builderimpl"
+	"encr.dev/pkg/cueutil"
+	"encr.dev/pkg/dockerbuild"
+	"encr.dev/pkg/fns"
+	"encr.dev/pkg/option"
 	"encr.dev/pkg/vcs"
 	daemonpb "encr.dev/proto/encore/daemon"
 )
 
-const (
-	appExePath = "/encore-app"
-)
-
 // Docker exports the app as a docker image.
-func Docker(ctx context.Context, req *daemonpb.ExportRequest, log zerolog.Logger) (success bool, err error) {
+func Docker(ctx context.Context, app *apps.Instance, req *daemonpb.ExportRequest, log zerolog.Logger) (success bool, err error) {
 	params := req.GetDocker()
 	if params == nil {
 		return false, errors.Newf("unsupported format: %T", req.Format)
 	}
 
-	vcsRevision := vcs.GetRevision(req.AppRoot)
-	cfg := &compiler.Config{
-		Revision:              vcsRevision.Revision,
-		UncommittedChanges:    vcsRevision.Uncommitted,
-		WorkingDir:            ".",
-		CgoEnabled:            false,
-		BuildTags:             []string{"timetzdata"},
-		StaticLink:            true,
-		EncoreCompilerVersion: fmt.Sprintf("EncoreCLI/%s", version.Version),
-		EncoreRuntimePath:     env.EncoreRuntimePath(),
-		EncoreGoRoot:          env.EncoreGoRoot(),
-		GOOS:                  req.Goos,
-		GOARCH:                req.Goarch,
-		KeepOutput:            false,
+	expSet, err := app.Experiments(req.Environ)
+	if err != nil {
+		return false, errors.Wrap(err, "get experimental features")
+	}
+
+	vcsRevision := vcs.GetRevision(app.Root())
+	buildInfo := builder.BuildInfo{
+		BuildTags:          []string{"timetzdata"},
+		CgoEnabled:         req.CgoEnabled,
+		StaticLink:         true,
+		DebugMode:          builder.DebugModeDisabled,
+		Environ:            req.Environ,
+		GOOS:               req.Goos,
+		GOARCH:             req.Goarch,
+		KeepOutput:         false,
+		Revision:           vcsRevision.Revision,
+		UncommittedChanges: vcsRevision.Uncommitted,
+
+		// Use the local JS runtime if this is a development build.
+		UseLocalJSRuntime: version.Channel == version.DevBuild,
+	}
+	appLang := app.Lang()
+	bld := builderimpl.Resolve(appLang, expSet)
+	defer fns.CloseIgnore(bld)
+	parse, err := bld.Parse(ctx, builder.ParseParams{
+		Build:       buildInfo,
+		App:         app,
+		Experiments: expSet,
+		WorkingDir:  ".",
+		ParseTests:  false,
+	})
+	if err != nil {
+		return false, err
+	}
+	if err := app.CacheMetadata(parse.Meta); err != nil {
+		log.Info().Err(err).Msg("failed to cache metadata")
+		return false, errors.Wrap(err, "cache metadata")
+	}
+
+	// Validate the service configs.
+	_, err = bld.ServiceConfigs(ctx, builder.ServiceConfigsParams{
+		Parse: parse,
+		CueMeta: &cueutil.Meta{
+			// Dummy data to satisfy config validation.
+			APIBaseURL: "http://localhost:0",
+			EnvName:    "encore-eject",
+			EnvType:    cueutil.EnvType_Development,
+			CloudType:  cueutil.CloudType_Local,
+		},
+	})
+	if err != nil {
+		return false, err
 	}
 
 	log.Info().Msgf("compiling Encore application for %s/%s", req.Goos, req.Goarch)
-	result, err := compiler.Build(req.AppRoot, cfg)
-	if result != nil && result.Dir != "" {
-		defer os.RemoveAll(result.Dir)
-	}
+	result, err := bld.Compile(ctx, builder.CompileParams{
+		Build:       buildInfo,
+		App:         app,
+		Parse:       parse,
+		OpTracker:   nil, // TODO
+		Experiments: expSet,
+		WorkingDir:  ".",
+	})
+
 	if err != nil {
 		log.Info().Err(err).Msg("compilation failed")
 		return false, errors.Wrap(err, "compilation failed")
 	}
 
-	img, err := buildDockerImage(ctx, log, req, result)
+	var crossNodeRuntime option.Option[dockerbuild.HostPath]
+	if appLang == appfile.LangTS && buildInfo.IsCrossBuild() {
+		binary, err := downloadBinary(req.Goos, req.Goarch, "encore-runtime.node", log)
+		if err != nil {
+			return false, errors.Wrap(err, "download runtime binaries")
+		}
+		crossNodeRuntime = option.Some(binary)
+	}
+
+	buildSettings, err := app.BuildSettings()
+	if err != nil {
+		return false, errors.Wrap(err, "get build settings")
+	}
+
+	describeCfg := dockerbuild.DescribeConfig{
+		Meta:              parse.Meta,
+		Compile:           result,
+		BundleSource:      option.Option[dockerbuild.BundleSourceSpec]{},
+		DockerBaseImage:   option.AsOptional(params.BaseImageTag),
+		Runtimes:          dockerbuild.HostPath(env.EncoreRuntimesPath()),
+		NodeRuntime:       crossNodeRuntime,
+		ProcessPerService: buildSettings.Docker.ProcessPerService,
+	}
+
+	if buildSettings.Docker.BundleSource || appLang == appfile.LangTS {
+		describeCfg.BundleSource = option.Some(dockerbuild.BundleSourceSpec{
+			Source: dockerbuild.HostPath(app.Root()),
+			Dest:   "/workspace",
+			ExcludeSource: []dockerbuild.RelPath{
+				".git",
+			},
+		})
+
+		if describeCfg.WorkingDir.Empty() {
+			// Set the working directory to "/workspace" by default, in this case.
+			describeCfg.WorkingDir = option.Some[dockerbuild.ImagePath]("/workspace")
+		}
+	}
+
+	spec, err := dockerbuild.Describe(describeCfg)
+	if err != nil {
+		return false, errors.Wrap(err, "describe docker image")
+	}
+
+	cors, err := app.GlobalCORS()
+	if err != nil {
+		return false, errors.Wrap(err, "get global CORS")
+	}
+	var logResponse string
+	if !req.SkipInfraConf {
+		cfg, infraCfgOutput, err := buildAndValidateInfraConfig(EmbeddedInfraConfigParams{
+			File:       dockerbuild.HostPath(req.InfraConfPath),
+			Services:   req.Services,
+			Gateways:   req.Gateways,
+			GlobalCORS: cors,
+			Meta:       parse.Meta,
+		})
+		logResponse = infraCfgOutput
+		if err != nil {
+			return false, errors.Wrap(err, "build infra config")
+		}
+		data, err := json.Marshal(cfg)
+		if err != nil {
+			return false, errors.Wrap(err, "marshal infra config")
+		}
+		spec.WriteFiles[defaultInfraConfigPath] = data
+		spec.Env = append(spec.Env, fmt.Sprintf("ENCORE_INFRA_CONFIG_PATH=%s", defaultInfraConfigPath))
+	}
+	var baseImgOverride option.Option[v1.Image]
+	if params.BaseImageTag != "" {
+		baseImg, err := resolveBaseImage(ctx, log, params, spec)
+		if err != nil {
+			return false, errors.Wrap(err, "resolve base image")
+		}
+		baseImgOverride = option.Some(baseImg)
+	}
+
+	var supervisorPath option.Option[dockerbuild.HostPath]
+	if spec.Supervisor.Present() {
+		binary, err := downloadBinary(req.Goos, req.Goarch, "supervisor-encore", log)
+		if err != nil {
+			return false, errors.Wrap(err, "download supervisor binaries")
+		}
+		supervisorPath = option.Some(binary)
+	}
+	img, err := dockerbuild.BuildImage(ctx, spec, dockerbuild.ImageBuildConfig{
+		BuildTime:         time.Now(),
+		BaseImageOverride: baseImgOverride,
+		AddCACerts:        option.Some[dockerbuild.ImagePath](""),
+		SupervisorPath:    supervisorPath,
+	})
 	if err != nil {
 		return false, errors.Wrap(err, "build docker image")
 	}
@@ -100,71 +229,11 @@ func Docker(ctx context.Context, req *daemonpb.ExportRequest, log zerolog.Logger
 		}
 	}
 
+	log.Info().Msgf("successfully exported app as docker image\n%s", logResponse)
 	return true, nil
 }
 
-// buildDockerImage builds a docker image.
-func buildDockerImage(ctx context.Context, log zerolog.Logger, req *daemonpb.ExportRequest, res *compiler.Result) (v1.Image, error) {
-	baseImg, err := resolveBaseImage(ctx, log, req.GetDocker())
-	if err != nil {
-		return nil, errors.Wrap(err, "resolve base image")
-	}
-
-	log.Info().Msg("building docker image")
-	opener, err := buildImageFilesystem(ctx, res)
-	if err != nil {
-		return nil, errors.Wrap(err, "build image fs")
-	}
-
-	layer, err := tarball.LayerFromOpener(opener,
-		tarball.WithEstargz,
-		tarball.WithEstargzOptions(
-			estargz.WithPrioritizedFiles([]string{appExePath}),
-		),
-		tarball.WithCompressedCaching,
-		tarball.WithCompressionLevel(5), // balance speed and compression
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "create tarball layer")
-	}
-
-	created := v1.Time{Time: time.Now()}
-
-	img, err := mutate.Append(baseImg, mutate.Addendum{
-		Layer: layer,
-		History: v1.History{
-			Author:    "encore-app",
-			Created:   created,
-			CreatedBy: "encore.dev",
-			Comment:   "Built with encore.dev, the backend development engine",
-		},
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "add layer")
-	}
-
-	cfg, err := img.ConfigFile()
-	if err != nil {
-		return nil, errors.Wrap(err, "get image config")
-	}
-	cfg = cfg.DeepCopy()
-	cfg.Config.Entrypoint = []string{appExePath}
-	cfg.Config.Cmd = nil
-	cfg.Author = "encore.dev"
-	cfg.Created = created
-	cfg.Architecture = req.Goarch
-	cfg.OS = req.Goos
-
-	img, err = mutate.ConfigFile(img, cfg)
-	if err != nil {
-		return nil, errors.Wrap(err, "add config")
-	}
-
-	log.Info().Msg("successfully built docker image")
-	return img, nil
-}
-
-func resolveBaseImage(ctx context.Context, log zerolog.Logger, p *daemonpb.DockerExportParams) (v1.Image, error) {
+func resolveBaseImage(ctx context.Context, log zerolog.Logger, p *daemonpb.DockerExportParams, spec *dockerbuild.ImageSpec) (v1.Image, error) {
 	baseImgTag := p.BaseImageTag
 	if baseImgTag == "" || baseImgTag == "scratch" {
 		return empty.Image, nil
@@ -177,15 +246,24 @@ func resolveBaseImage(ctx context.Context, log zerolog.Logger, p *daemonpb.Docke
 		return nil, errors.Wrap(err, "parse base image")
 	}
 
+	fetchRemote := true
 	img, err := daemon.Image(baseImgRef)
-	if err != nil {
+	if err == nil {
+		file, err := img.ConfigFile()
+		if err == nil {
+			fetchRemote = file.OS != spec.OS || file.Architecture != spec.Arch
+		}
+	}
+	if fetchRemote {
 		log.Info().Msg("could not get image from local daemon, fetching it remotely")
 		keychain := authn.DefaultKeychain
-		img, err = remote.Image(baseImgRef, remote.WithAuthFromKeychain(keychain), remote.WithContext(ctx))
+		img, err = remote.Image(baseImgRef, remote.WithAuthFromKeychain(keychain), remote.WithContext(ctx), remote.WithPlatform(v1.Platform{
+			OS:           spec.OS,
+			Architecture: spec.Arch,
+		}))
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to fetch image")
 		}
-
 		// If the user requested to push the image locally, save the remote image locally as well.
 		if p.LocalDaemonTag != "" {
 			if tag, err := name.NewTag(baseImgTag, name.WeakValidation); err == nil {
@@ -200,104 +278,6 @@ func resolveBaseImage(ctx context.Context, log zerolog.Logger, p *daemonpb.Docke
 	}
 
 	return img, nil
-}
-
-func buildImageFilesystem(ctx context.Context, res *compiler.Result) (opener tarball.Opener, err error) {
-	tarFile, err := os.CreateTemp("", "docker-img")
-	if err != nil {
-		return nil, errors.Wrap(err, "mktemp")
-	}
-	defer func() {
-		if e := tarFile.Close(); e != nil && err == nil {
-			err = errors.Wrap(e, "close docker-img file")
-		}
-	}()
-
-	tw := tar.NewWriter(tarFile)
-
-	{
-		appFile, err := os.Open(res.Exe)
-		if err != nil {
-			return nil, errors.Wrap(err, "open")
-		}
-		defer func() { _ = appFile.Close() }()
-
-		fi, err := appFile.Stat()
-		if err != nil {
-			return nil, errors.Wrap(err, "stat")
-		}
-		err = tw.WriteHeader(&tar.Header{
-			Name:     appExePath,
-			Typeflag: tar.TypeReg,
-			Size:     fi.Size(),
-			Mode:     0555,
-		})
-		if err != nil {
-			return nil, errors.Wrap(err, "add file to tar")
-		}
-		if _, err := io.Copy(tw, appFile); err != nil {
-			return nil, errors.Wrap(err, "copy file to tar")
-		}
-	}
-
-	// Download ca certs
-	const certsDest = "/etc/ssl/certs/ca-certificates.crt" // from https://go.dev/src/crypto/x509/root_linux.go
-	if err := addCACerts(ctx, tw, certsDest); err != nil {
-		return nil, errors.Wrap(err, "add ca certs")
-	}
-
-	if err := tw.Close(); err != nil {
-		return nil, errors.Wrap(err, "complete tar")
-	}
-
-	opener = func() (io.ReadCloser, error) {
-		return os.Open(tarFile.Name())
-	}
-	return opener, nil
-}
-
-// addCACerts downloads CA Certs from Mozilla's official source.
-func addCACerts(ctx context.Context, tw *tar.Writer, dest string) error {
-	const mozillaRootStoreWebsiteTrustBitEnabledURL = "https://ccadb-public.secure.force.com/mozilla/IncludedRootsPEMTxt?TrustBitsInclude=Websites"
-	req, err := http.NewRequestWithContext(ctx, "GET", mozillaRootStoreWebsiteTrustBitEnabledURL, nil)
-	if err != nil {
-		return errors.Wrap(err, "create request")
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return errors.Wrap(err, "get root certs")
-	}
-	defer resp.Body.Close()
-
-	// We need to populate the body of the tar file before writing the contents.
-	// Use the content length if it was provided. Otherwise read the whole response
-	// into memory and use its length.
-	var body io.Reader = resp.Body
-	size := resp.ContentLength
-	if size < 0 {
-		// Unknown body; read the whole response into memory
-		data, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return errors.Wrap(err, "read cert data")
-		}
-		size = int64(len(data))
-		body = bytes.NewReader(data)
-	}
-
-	// Add the file
-	err = tw.WriteHeader(&tar.Header{
-		Typeflag: tar.TypeReg,
-		Name:     dest,
-		Size:     size,
-	})
-	if err != nil {
-		return errors.Wrap(err, "create cert file")
-	}
-	if _, err := io.Copy(tw, body); err != nil {
-		return errors.Wrap(err, "write cert data")
-	}
-	return nil
 }
 
 func pushDockerImage(ctx context.Context, log zerolog.Logger, img v1.Image, destination name.Tag) error {

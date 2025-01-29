@@ -1,30 +1,40 @@
 package optracker
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"runtime"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/logrusorgru/aurora/v3"
+
+	"encr.dev/pkg/ansi"
+	"encr.dev/pkg/errlist"
+	daemonpb "encr.dev/proto/encore/daemon"
 )
 
-func New(w io.Writer) *OpTracker {
+type OutputStream interface {
+	Send(*daemonpb.CommandMessage) error
+}
+
+func New(w io.Writer, stream OutputStream) *OpTracker {
 	return &OpTracker{
-		w: w,
+		w:      w,
+		stream: stream,
 	}
 }
 
 type OpTracker struct {
-	mu      sync.Mutex
-	ops     []*slowOp
-	w       io.Writer
-	nl      int // number of lines written
-	started bool
-	quit    bool
+	mu          sync.Mutex
+	ops         []*slowOp
+	w           io.Writer
+	started     bool
+	quit        bool // quit indicates that the tracker has been stopped (this should only be set by AllDone)
+	savedCursor sync.Once
+	stream      OutputStream
 }
 
 type OperationID int
@@ -32,7 +42,7 @@ type OperationID int
 const NoOperationID OperationID = -1
 
 // AllDone marks all ops as done.
-// This function is safe to call on a Nil OpTracker and will no-op in that case
+// This function is safe to call on a Nil OpTracker.
 func (t *OpTracker) AllDone() {
 	if t == nil {
 		return
@@ -40,6 +50,12 @@ func (t *OpTracker) AllDone() {
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
+	// If we've already quit, don't do anything
+	if t.quit == true {
+		return
+	}
+
 	now := time.Now()
 	for _, o := range t.ops {
 		if o.done.IsZero() || o.done.After(now) {
@@ -102,6 +118,8 @@ func (t *OpTracker) Done(id OperationID, minDuration time.Duration) {
 	t.refresh()
 }
 
+var ErrCanceled = errors.New("operation canceled")
+
 // Fail marks the operation as failed with the given error
 //
 // This function is safe to call on a Nil OpTracker and will no-op in that case
@@ -120,12 +138,20 @@ func (t *OpTracker) Fail(id OperationID, err error) {
 	t.refresh()
 }
 
+// Cancel marks the operation as canceled.
+// It is equivalent to t.Fail(id, ErrCanceled).
+func (t *OpTracker) Cancel(id OperationID) {
+	t.Fail(id, ErrCanceled)
+}
+
 // refresh refreshes the display by writing to t.w.
 // The mutex must be held by the caller.
 func (t *OpTracker) refresh() {
-	fmt.Fprint(t.w, "\u001b[0;0H\u001b[0J\n")
+	t.savedCursor.Do(func() {
+		fmt.Fprint(t.w, ansi.SaveCursorPosition)
+	})
+	fmt.Fprint(t.w, ansi.RestoreCursorPosition+ansi.ClearScreen(ansi.CursorToBottom))
 
-	nl := 0
 	now := time.Now()
 
 	// Sort ops by start time
@@ -146,7 +172,19 @@ func (t *OpTracker) refresh() {
 		format := "  %s %s... "
 		switch {
 		case done && o.err != nil:
-			msg = aurora.Red(fmt.Sprintf(format+"Failed: %v", fail, o.msg, o.err))
+			if errors.Is(o.err, ErrCanceled) {
+				msg = aurora.Yellow(fmt.Sprintf(format+"Canceled", canceled, o.msg))
+			} else {
+				if errlist := errlist.Convert(o.err); errlist != nil {
+					if len(errlist.List) > 0 {
+						msg = aurora.Red(fmt.Sprintf(format+"Failed: %v", fail, o.msg, errlist.List[0].Title()))
+					} else {
+						msg = aurora.Red(fmt.Sprintf(format+"Failed: %v", fail, o.msg, errlist))
+					}
+				} else {
+					msg = aurora.Red(fmt.Sprintf(format+"Failed: %v", fail, o.msg, o.err))
+				}
+			}
 		case done && o.err == nil:
 			msg = aurora.Green(fmt.Sprintf(format+"Done!", success, o.msg))
 		case !done:
@@ -154,10 +192,12 @@ func (t *OpTracker) refresh() {
 			o.spinIdx = (o.spinIdx + 1) % len(spinner)
 		}
 		str := msg.String()
-		fmt.Fprintf(t.w, "\u001b[2K%s\n", str)
-		nl += strings.Count(str, "\n") + 1
+		fmt.Fprintf(t.w, "%s%s%s\n",
+			ansi.MoveCursorLeft(1000),
+			ansi.ClearLine(ansi.WholeLine),
+			str,
+		)
 	}
-	t.nl = nl
 }
 
 func (t *OpTracker) spin() {
@@ -189,7 +229,8 @@ type slowOp struct {
 }
 
 var (
-	success = "✔"
-	fail    = "❌"
-	spinner = []string{"⠋", "⠙", "⠚", "⠒", "⠂", "⠂", "⠒", "⠲", "⠴", "⠦", "⠖", "⠒", "⠐", "⠐", "⠒", "⠓", "⠋"}
+	success  = "✔"
+	fail     = "❌"
+	canceled = "⚠️"
+	spinner  = []string{"⠋", "⠙", "⠚", "⠒", "⠂", "⠂", "⠒", "⠲", "⠴", "⠦", "⠖", "⠒", "⠐", "⠐", "⠒", "⠓", "⠋"}
 )

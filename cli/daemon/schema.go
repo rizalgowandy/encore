@@ -27,6 +27,7 @@ type schemaRenderer struct {
 	*jsoniter.Stream
 	meta      *meta.Data
 	seenDecls map[uint32]*schema.Decl
+	typeArgs  []*schema.Type
 }
 
 func (r *schemaRenderer) Render(d *schema.Type) []byte {
@@ -46,6 +47,34 @@ func (r *schemaRenderer) renderType(typ *schema.Type) {
 		r.renderBuiltin(typ.Builtin)
 	case *schema.Type_Named:
 		r.renderNamed(typ.Named)
+	case *schema.Type_Pointer:
+		r.renderType(typ.Pointer.Base)
+	case *schema.Type_Union:
+		r.renderType(typ.Union.Types[0])
+	case *schema.Type_Literal:
+		switch v := typ.Literal.Value.(type) {
+		case *schema.Literal_Str:
+			r.WriteString(v.Str)
+		case *schema.Literal_Int:
+			r.WriteInt(int(v.Int))
+		case *schema.Literal_Float:
+			r.WriteFloat64(v.Float)
+		case *schema.Literal_Boolean:
+			r.WriteBool(v.Boolean)
+		case *schema.Literal_Null:
+			r.WriteNil()
+		default:
+			panic(fmt.Sprintf("unknown literal type %T", v))
+		}
+	case *schema.Type_TypeParameter:
+		if idx := typ.TypeParameter.ParamIdx; len(r.typeArgs) > int(idx) {
+			r.renderType(r.typeArgs[idx])
+		} else {
+			r.WriteNil()
+		}
+	case *schema.Type_Config:
+		// Config is invisible here
+		r.renderType(typ.Config.Elem)
 	default:
 		panic(fmt.Sprintf("unknown schema type %T", typ))
 	}
@@ -124,6 +153,14 @@ func (r *schemaRenderer) renderNamed(n *schema.Named) {
 		r.WriteNil()
 		return
 	}
+
+	// Store type arguments in scope. Restore the previous
+	// type arguments when we're done.
+	prevTypeArgs := r.typeArgs
+	defer func() {
+		r.typeArgs = prevTypeArgs
+	}()
+	r.typeArgs = n.TypeArguments
 
 	// Avoid infinite recursion
 	decl := r.meta.Decls[n.Id]

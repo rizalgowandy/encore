@@ -1,0 +1,73 @@
+package main
+
+import (
+	"context"
+	"os"
+	"os/signal"
+	"path/filepath"
+
+	"github.com/spf13/cobra"
+
+	"encr.dev/cli/cmd/encore/cmdutil"
+	"encr.dev/cli/cmd/encore/root"
+	daemonpb "encr.dev/proto/encore/daemon"
+)
+
+var execCmd = &cobra.Command{
+	Use:   "exec path/to/script [args...]",
+	Short: "Runs executable scripts against the local Encore app",
+	Run: func(cmd *cobra.Command, args []string) {
+		if len(args) == 0 {
+			args = []string{"."} // current directory
+		}
+		appRoot, wd := determineAppRoot()
+		execScript(appRoot, wd, args)
+	},
+}
+
+func execScript(appRoot, relWD string, args []string) {
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-interrupt
+		cancel()
+	}()
+
+	commandRelPath := filepath.ToSlash(filepath.Join(relWD, args[0]))
+	scriptArgs := args[1:]
+
+	daemon := setupDaemon(ctx)
+	stream, err := daemon.ExecScript(ctx, &daemonpb.ExecScriptRequest{
+		AppRoot:        appRoot,
+		WorkingDir:     relWD,
+		CommandRelPath: commandRelPath,
+		ScriptArgs:     scriptArgs,
+		Environ:        os.Environ(),
+		TraceFile:      root.TraceFile,
+		Namespace:      nonZeroPtr(nsName),
+	})
+	if err != nil {
+		fatal(err)
+	}
+
+	cmdutil.ClearTerminalExceptFirstNLines(1)
+	code := cmdutil.StreamCommandOutput(stream, cmdutil.ConvertJSONLogs())
+	os.Exit(code)
+}
+
+var alphaCmd = &cobra.Command{
+	Use:    "alpha",
+	Short:  "Pre-release functionality in alpha stage",
+	Hidden: true,
+}
+
+func init() {
+	rootCmd.AddCommand(alphaCmd)
+}
+
+func init() {
+	execCmd.Flags().StringVarP(&nsName, "namespace", "n", "", "Namespace to use (defaults to active namespace)")
+	alphaCmd.AddCommand(execCmd)
+}

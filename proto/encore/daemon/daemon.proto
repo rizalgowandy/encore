@@ -11,6 +11,10 @@ service Daemon {
   rpc Run (RunRequest) returns (stream CommandMessage);
   // Test runs tests.
   rpc Test (TestRequest) returns (stream CommandMessage);
+  // TestSpec returns the specification for how to run tests.
+  rpc TestSpec (TestSpecRequest) returns (TestSpecResponse);
+  // ExecScript executes a one-off script.
+  rpc ExecScript (ExecScriptRequest) returns (stream CommandMessage);
   // Check checks the app for compilation errors.
   rpc Check (CheckRequest) returns (stream CommandMessage);
   // Export exports the app in various formats.
@@ -26,16 +30,35 @@ service Daemon {
 
   // GenClient generates a client based on the app's API.
   rpc GenClient (GenClientRequest) returns (GenClientResponse);
-  // SetSecret sets a secret key on the encore.dev platform.
-  rpc SetSecret (SetSecretRequest) returns (SetSecretResponse);
+  // GenWrappers generates user-facing wrapper code.
+  rpc GenWrappers (GenWrappersRequest) returns (GenWrappersResponse);
+  // SecretsRefresh tells the daemon to refresh the local development secrets
+  // for the given application.
+  rpc SecretsRefresh (SecretsRefreshRequest) returns (SecretsRefreshResponse);
   // Version reports the daemon version.
   rpc Version (google.protobuf.Empty) returns (VersionResponse);
+
+  // CreateNamespace creates a new infra namespace.
+  rpc CreateNamespace (CreateNamespaceRequest) returns (Namespace);
+  // SwitchNamespace switches the active infra namespace.
+  rpc SwitchNamespace (SwitchNamespaceRequest) returns (Namespace);
+  // ListNamespaces lists all namespaces for the given app.
+  rpc ListNamespaces (ListNamespacesRequest) returns (ListNamespacesResponse);
+  // DeleteNamespace deletes an infra namespace.
+  rpc DeleteNamespace (DeleteNamespaceRequest) returns (google.protobuf.Empty);
+
+  rpc DumpMeta(DumpMetaRequest) returns (DumpMetaResponse);
+  // Telemetry enables or disables telemetry.
+  rpc Telemetry(TelemetryConfig) returns (google.protobuf.Empty);
+  // InitTutorial sets the tutorial flag of the app
+  rpc CreateApp(CreateAppRequest)  returns (CreateAppResponse);
 }
 
 message CommandMessage {
   oneof msg {
     CommandOutput output = 1;
     CommandExit exit = 2;
+    CommandDisplayErrors errors = 3;
   }
 }
 
@@ -48,17 +71,29 @@ message CommandExit {
   int32 code = 1; // exit code
 }
 
+message CommandDisplayErrors {
+  bytes errinsrc = 1; // error messages in source code
+}
+
+message CreateAppRequest {
+  // app_root is the absolute filesystem path to the Encore app root.
+  string app_root = 1;
+  // template is the template used to create the app
+  string template = 2;
+  // tutorial is a flag to indicate if the app is a tutorial app
+  bool tutorial = 3;
+}
+
+message CreateAppResponse {
+  string app_id = 1;
+}
+
 message RunRequest {
   // app_root is the absolute filesystem path to the Encore app root.
   string app_root = 1;
   // working_dir is the working directory relative to the app_root,
   // for formatting relative paths in error messages.
   string working_dir = 2;
-  // tunnel, if true, creates a tunnel environment on the encore.dev platform
-  // that forwards requests to the running app.
-  bool tunnel = 3;
-  // debug, if true, compiles the app with flags that improve the debugging experience.
-  bool debug = 4;
   // watch, if true, enables live reloading of the app whenever the source changes.
   bool watch = 5;
   // listen_addr is the address to listen on.
@@ -66,6 +101,32 @@ message RunRequest {
   // environ is the environment to set for the running command.
   // Each entry is a string in the format "KEY=VALUE", identical to os.Environ().
   repeated string environ = 7;
+
+  // trace_file, if set specifies a trace file to write trace information
+  // about the parse and compilation process to.
+  optional string trace_file = 8;
+
+  // namespace is the infrastructure namespace to use.
+  // If empty the active namespace is used.
+  optional string namespace = 9;
+
+  // browser specifies whether and how to open the browser on startup.
+  BrowserMode browser = 10;
+
+  // debug_mode specifies the debug mode to use.
+  DebugMode debug_mode = 11;
+  
+  enum BrowserMode {
+    BROWSER_AUTO = 0;
+    BROWSER_NEVER = 1;
+    BROWSER_ALWAYS = 2;
+  }
+
+  enum DebugMode {
+    DEBUG_DISABLED = 0;
+    DEBUG_ENABLED = 1;
+    DEBUG_BREAK = 2;
+  }
 }
 
 message TestRequest {
@@ -75,6 +136,54 @@ message TestRequest {
   // environ is the environment to set for the running command.
   // Each entry is a string in the format "KEY=VALUE", identical to os.Environ().
   repeated string environ = 4;
+
+  // No longer used; debug, if true, compiles the app with flags that improve the debugging experience.
+  reserved 5;
+
+  // trace_file, if set specifies a trace file to write trace information
+  // about the parse and compilation process to.
+  optional string trace_file = 6;
+
+  // codegen_debug, if true, dumps the generated code and prints where it is located.
+  bool codegen_debug = 7;
+}
+
+message TestSpecRequest {
+  string app_root = 1;
+  string working_dir = 2;
+  repeated string args = 3;
+
+  // environ is the environment to set for the running command.
+  // Each entry is a string in the format "KEY=VALUE", identical to os.Environ().
+  repeated string environ = 4;
+}
+
+message TestSpecResponse {
+  string command = 1;
+  repeated string args = 2;
+  repeated string environ = 3;
+}
+
+message ExecScriptRequest {
+  string app_root = 1;
+  string working_dir = 2;
+
+  // command_rel_path is the slash-separated relative path to the command to run,
+  // from the app root.
+  string command_rel_path = 3;
+
+  repeated string script_args = 4;
+  // environ is the environment to set for the running command.
+  // Each entry is a string in the format "KEY=VALUE", identical to os.Environ().
+  repeated string environ = 5;
+
+  // trace_file, if set specifies a trace file to write trace information
+  // about the parse and compilation process to.
+  optional string trace_file = 6;
+
+  // namespace is the infrastructure namespace to use.
+  // If empty the active namespace is used.
+  optional string namespace = 7;
 }
 
 message CheckRequest {
@@ -82,6 +191,11 @@ message CheckRequest {
   string working_dir = 2;
   // codegen_debug, if true, dumps the generated code and prints where it is located.
   bool codegen_debug = 3;
+  // parse_tests, if true, exercises test parsing and codegen as well.
+  bool parse_tests = 4;
+  // environ is the environment to set for the running command.
+  // Each entry is a string in the format "KEY=VALUE", identical to os.Environ().
+  repeated string environ = 5;
 }
 
 message ExportRequest {
@@ -97,10 +211,19 @@ message ExportRequest {
   // if true.
   bool cgo_enabled = 4;
 
+  // environ is the environment to set for the running command.
+  // Each entry is a string in the format "KEY=VALUE", identical to os.Environ().
+  repeated string environ = 5;
+
   oneof format {
     // docker specifies to export the app as a docker image.
-    DockerExportParams docker = 5;
+    DockerExportParams docker = 6;
   }
+
+  string infra_conf_path = 7;
+  repeated string services = 8;
+  repeated string gateways = 9;
+  bool skip_infra_conf = 10;
 }
 
 message DockerExportParams {
@@ -118,15 +241,32 @@ message DockerExportParams {
   string base_image_tag = 3;
 }
 
-message ResetDBRequest {
-  string app_root = 1;
-  repeated string services = 2; // services to reset
-}
-
 message DBConnectRequest {
   string app_root = 1;
   string db_name = 2;
   string env_name = 3; // optional
+  DBClusterType cluster_type = 4;
+
+  // namespace is the infrastructure namespace to use.
+  // If empty the active namespace is used.
+  optional string namespace = 5;
+
+  DBRole role = 6;
+}
+
+enum DBRole {
+  DB_ROLE_UNSPECIFIED = 0;
+  DB_ROLE_SUPERUSER = 1;
+  DB_ROLE_ADMIN = 2;
+  DB_ROLE_WRITE = 3;
+  DB_ROLE_READ = 4;
+}
+
+enum DBClusterType {
+  DB_CLUSTER_TYPE_UNSPECIFIED = 0;
+  DB_CLUSTER_TYPE_RUN = 1;
+  DB_CLUSTER_TYPE_TEST = 2;
+  DB_CLUSTER_TYPE_SHADOW = 3;
 }
 
 message DBConnectResponse {
@@ -137,11 +277,22 @@ message DBProxyRequest {
   string app_root = 1;
   string env_name = 2; // optional
   int32 port = 3; // optional
+  DBClusterType cluster_type = 4;
+
+  // namespace is the infrastructure namespace to use.
+  // If empty the active namespace is used.
+  optional string namespace = 5;
+  DBRole role = 6;
 }
 
 message DBResetRequest {
   string app_root = 1;
-  repeated string services = 2; // services to reset
+  repeated string database_names = 2; // database names to reset
+  DBClusterType cluster_type = 3;
+
+  // namespace is the infrastructure namespace to use.
+  // If empty the active namespace is used.
+  optional string namespace = 4;
 }
 
 message GenClientRequest {
@@ -149,28 +300,244 @@ message GenClientRequest {
   string env_name = 2;
   string lang = 3;
   string filepath = 4;
+
+  // Services to include in the output.
+  // If the string "*" is present all services are included.
+  repeated string services = 5;
+
+  // Services to exclude from the output.
+  // Takes precedence over 'services' above.
+  repeated string excluded_services = 6;
+
+  // Tags of endpoints to include in the output.
+  // Only includes endpoints from services included in 'services' above.
+  repeated string endpoint_tags = 7;
+
+  // Tags of endpoints to exclude from the output.
+  // Takes precedence over 'endpoint_tags' above.
+  repeated string excluded_endpoint_tags = 8;
+
+  // The OpenAPI spec generator by default includes private endpoints.
+  // If this is set to `true`, private endpoints will not be included
+  // in the generated OpenAPI spec.
+  optional bool openapi_exclude_private_endpoints = 9;
 }
 
 message GenClientResponse {
   bytes code = 1;
 }
 
-message SetSecretRequest {
-  enum Type {
-    DEVELOPMENT = 0;
-    PRODUCTION = 1;
-  }
+message GenWrappersRequest {
+  string app_root = 1;
+}
+
+message GenWrappersResponse {
+}
+
+message SecretsRefreshRequest {
   string app_root = 1;
   string key = 2;
   string value = 3;
-  Type type = 4;
 }
 
-message SetSecretResponse {
-  bool created = 1; // whether or not the secret was created (as opposed to updated)
+message SecretsRefreshResponse {
 }
 
 message VersionResponse {
   string version = 1;
   string config_hash = 2;
+}
+
+// Namespaces
+
+message Namespace {
+  string id = 1;
+  string name = 2;
+  bool active = 3;
+  string created_at = 4;
+  optional string last_active_at = 5;
+}
+
+message CreateNamespaceRequest {
+  string app_root = 1;
+  string name = 2;
+}
+
+message SwitchNamespaceRequest {
+  string app_root = 1;
+  string name = 2;
+  bool create = 3;
+}
+
+message ListNamespacesRequest {
+  string app_root = 1;
+}
+
+message DeleteNamespaceRequest {
+  string app_root = 1;
+  string name = 2;
+}
+
+message ListNamespacesResponse {
+  repeated Namespace namespaces = 1;
+}
+
+message TelemetryConfig {
+  string anon_id = 1;
+  bool enabled = 2;
+  bool debug = 3;
+}
+
+message DumpMetaRequest {
+  string app_root = 1;
+  string working_dir = 2; // for error reporting
+
+  // environ is the environment to set for the running command.
+  // Each entry is a string in the format "KEY=VALUE", identical to os.Environ().
+  repeated string environ = 3;
+
+  // Whether or not to parse tests.
+  bool parse_tests = 4;
+
+  Format format = 5;
+
+  enum Format {
+    FORMAT_UNSPECIFIED = 0;
+    FORMAT_JSON = 1;
+    FORMAT_PROTO = 2;
+  }
+}
+
+message DumpMetaResponse {
+  bytes meta = 1;
+}
+
+
+
+// The following messages are used for sqlc plugin integration.
+message SQLCPlugin {
+  message File {
+    string name = 1 [json_name = "name"];
+    bytes contents = 2 [json_name = "contents"];
+  }
+
+  message Settings {
+    // Rename message was field 5
+    // Overides message was field 6
+    // PythonCode message was field 8
+    // KotlinCode message was field 9
+    // GoCode message was field 10;
+    // JSONCode message was field 11;
+    reserved 5, 8, 9, 10, 11;
+
+    string version = 1 [json_name = "version"];
+    string engine = 2 [json_name = "engine"];
+    repeated string schema = 3 [json_name = "schema"];
+    repeated string queries = 4 [json_name = "queries"];
+    Codegen codegen = 12 [json_name = "codegen"];
+  }
+
+  message Codegen {
+    message Process {
+      string cmd = 1;
+    }
+    message WASM {
+      string url = 1;
+      string sha256 = 2;
+    }
+    string out = 1 [json_name = "out"];
+    string plugin = 2 [json_name = "plugin"];
+    bytes options = 3 [json_name = "options"];
+    repeated string env = 4 [json_name = "env"];
+    Process process = 5 [json_name = "process"];
+    WASM wasm = 6 [json_name = "wasm"];
+  }
+
+  message Catalog {
+    string comment = 1;
+    string default_schema = 2;
+    string name = 3;
+    repeated Schema schemas = 4;
+  }
+
+  message Schema {
+    string comment = 1;
+    string name = 2;
+    repeated Table tables = 3;
+    repeated Enum enums = 4;
+    repeated CompositeType composite_types = 5;
+  }
+
+  message CompositeType {
+    string name = 1;
+    string comment = 2;
+  }
+
+  message Enum {
+    string name = 1;
+    repeated string vals = 2;
+    string comment = 3;
+  }
+
+  message Table {
+    Identifier rel = 1;
+    repeated Column columns = 2;
+    string comment = 3;
+  }
+
+  message Identifier {
+    string catalog = 1;
+    string schema = 2;
+    string name = 3;
+  }
+
+  message Column {
+    string name = 1;
+    bool not_null = 3;
+    bool is_array = 4;
+    string comment = 5;
+    int32 length = 6;
+    bool is_named_param = 7;
+    bool is_func_call = 8;
+
+    // XXX: Figure out what PostgreSQL calls `foo.id`
+    string scope = 9;
+    Identifier table = 10;
+    string table_alias = 11;
+    Identifier type = 12;
+    bool is_sqlc_slice = 13;
+    Identifier embed_table = 14;
+    string original_name = 15;
+    bool unsigned = 16;
+    int32 array_dims = 17;
+  }
+
+  message Query {
+    string text = 1 [json_name = "text"];
+    string name = 2 [json_name = "name"];
+    string cmd = 3 [json_name = "cmd"];
+    repeated Column columns = 4 [json_name = "columns"];
+    repeated Parameter params = 5 [json_name = "parameters"];
+    repeated string comments = 6 [json_name = "comments"];
+    string filename = 7 [json_name = "filename"];
+    Identifier insert_into_table = 8 [json_name = "insert_into_table"];
+  }
+
+  message Parameter {
+    int32 number = 1 [json_name = "number"];
+    Column column = 2 [json_name = "column"];
+  }
+
+  message GenerateRequest {
+    Settings settings = 1 [json_name = "settings"];
+    Catalog catalog = 2 [json_name = "catalog"];
+    repeated Query queries = 3 [json_name = "queries"];
+    string sqlc_version = 4 [json_name = "sqlc_version"];
+    bytes plugin_options = 5 [json_name = "plugin_options"];
+    bytes global_options = 6 [json_name = "global_options"];
+  }
+
+  message GenerateResponse {
+    repeated File files = 1 [json_name = "files"];
+  }
 }

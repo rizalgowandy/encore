@@ -13,11 +13,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgconn"
+	"github.com/jackc/pgproto3/v2"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgproto3/v2"
+	"encr.dev/pkg/fns"
 )
 
 type LogicalConn interface {
@@ -64,19 +65,20 @@ func (e DatabaseNotFoundError) Error() string {
 }
 
 func (p *SingleBackendProxy) Serve(ctx context.Context, ln net.Listener) error {
-	defer ln.Close()
+	defer fns.CloseIgnore(ln)
 	if p.gotBackend != nil {
 		panic("SingleBackendProxy: Serve called twice")
 	}
 	p.gotBackend = make(chan struct{})
 
 	go func() {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		defer cancel()
+
 		select {
 		case <-p.gotBackend:
-		case <-time.After(10 * time.Minute):
-			ln.Close()
 		case <-ctx.Done():
-			ln.Close()
+			_ = ln.Close()
 		}
 	}()
 
@@ -112,7 +114,7 @@ func (p *SingleBackendProxy) Serve(ctx context.Context, ln net.Listener) error {
 }
 
 func (p *SingleBackendProxy) ProxyConn(ctx context.Context, client net.Conn) {
-	defer client.Close()
+	defer fns.CloseIgnore(client)
 
 	cl, err := SetupClient(client, &ClientConfig{
 		TLS:          p.FrontendTLS,
@@ -139,13 +141,13 @@ func (p *SingleBackendProxy) doRunProxy(ctx context.Context, cl *Client) error {
 	startup := cl.Hello.(*StartupData)
 	server, err := p.DialBackend(ctx, startup)
 	if err != nil {
-		cl.Backend.Send(&pgproto3.ErrorResponse{
+		_ = cl.Backend.Send(&pgproto3.ErrorResponse{
 			Severity: "FATAL",
 			Message:  err.Error(),
 		})
 		return err
 	}
-	defer server.Close()
+	defer fns.CloseIgnore(server)
 
 	fe := pgproto3.NewFrontend(pgproto3.NewChunkReader(server), server)
 	log.Trace().Msg("successfully setup server connection")
@@ -275,7 +277,7 @@ func serverTLSNegotiate(server net.Conn, tlsConfig *tls.Config) (*pgproto3.Front
 		tlsConn := tls.Client(server, tlsConfig)
 		if err := tlsConn.Handshake(); err != nil {
 			log.Error().Err(err).Msg("server tls handshake failed")
-			tlsConn.Close()
+			_ = tlsConn.Close()
 			return nil, fmt.Errorf("server tls handshake failed: %v", err)
 		}
 		log.Trace().Msg("completed server tls handshake")
@@ -373,6 +375,8 @@ func clientTLSNegotiate(client net.Conn, tlsConfig *tls.Config) (*pgproto3.Backe
 	log.Trace().Msg("negotiating TLS with client")
 	backend := pgproto3.NewBackend(pgproto3.NewChunkReader(client), client)
 	hasTLS := false
+
+StartupMessageLoop:
 	for {
 		startup, err := backend.ReceiveStartupMessage()
 		if err != nil {
@@ -387,6 +391,7 @@ func clientTLSNegotiate(client net.Conn, tlsConfig *tls.Config) (*pgproto3.Backe
 				if _, err := client.Write([]byte{'N'}); err != nil {
 					return nil, nil, err
 				}
+				continue StartupMessageLoop
 			}
 
 			if _, err := client.Write([]byte{'S'}); err != nil {
@@ -394,7 +399,7 @@ func clientTLSNegotiate(client net.Conn, tlsConfig *tls.Config) (*pgproto3.Backe
 			}
 			tlsConn := tls.Server(client, tlsConfig)
 			if err := tlsConn.Handshake(); err != nil {
-				tlsConn.Close()
+				_ = tlsConn.Close()
 				return nil, nil, fmt.Errorf("client tls handshake failed: %v", err)
 			}
 			log.Trace().Msg("client tls handshake successful")
@@ -408,7 +413,11 @@ func clientTLSNegotiate(client net.Conn, tlsConfig *tls.Config) (*pgproto3.Backe
 			log.Debug().Msg("startup completed")
 			return backend, startup, nil
 		case *pgproto3.GSSEncRequest:
-			return nil, nil, fmt.Errorf("pgproxy: GSSAPI encryption not supported")
+			// We got a GSSAPI encryption request but we don't support it.
+			if _, err := client.Write([]byte{'N'}); err != nil {
+				return nil, nil, err
+			}
+			continue StartupMessageLoop
 		}
 	}
 }
@@ -420,7 +429,7 @@ type AuthData struct {
 
 // AuthenticateClient tells the client they've successfully authenticated.
 func AuthenticateClient(be *pgproto3.Backend) error {
-	be.SetAuthType(pgproto3.AuthTypeOk)
+	_ = be.SetAuthType(pgproto3.AuthTypeOk)
 	return be.Send(&pgproto3.AuthenticationOk{})
 }
 
@@ -428,8 +437,10 @@ func computeMD5(username, password string, salt [4]byte) string {
 	// concat('md5', md5(concat(md5(concat(password, username)), random-salt)))
 
 	// s1 := md5(concat(password, username))
+	// nosemgrep
 	s1 := md5.Sum([]byte(password + username))
 	// s2 := md5(concat(s1, random-salt))
+	// nosemgrep
 	s2 := md5.Sum([]byte(hex.EncodeToString(s1[:]) + string(salt[:])))
 	return "md5" + hex.EncodeToString(s2[:])
 }
@@ -482,47 +493,73 @@ func FinalizeInitialHandshake(client *pgproto3.Backend, server *pgproto3.Fronten
 
 // CopySteadyState copies messages back and forth after the initial handshake.
 func CopySteadyState(client *pgproto3.Backend, server *pgproto3.Frontend) error {
+	errChan := make(chan error, 2)
+	msgAck := make(chan struct{})
 	done := make(chan struct{})
 	defer close(done)
 
-	go func() {
-		// Copy from server to client.
+	runTask := func(task func() error) {
+		go func() {
+			errChan <- task()
+		}()
+	}
+	clientMsgs := make(chan pgproto3.FrontendMessage)
+
+	runTask(func() (err error) {
 		for {
 			msg, err := server.Receive()
-			if err != nil {
-				if errors.Is(err, net.ErrClosed) {
-					select {
-					case <-done:
-						// The client terminated the connection so our connection
-						// to the server is also being being torn down; ignore the error.
-						return
-					default:
-					}
-				}
-
-				log.Error().Err(err).Msg("pgproxy.CopySteadyState: failed to receive message from server")
-				return
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				log.Trace().Msg("pgproxy: connection terminated by server, closing connection")
+				return nil
+			} else if err != nil {
+				return err
 			}
 			if err := client.Send(msg); err != nil {
-				return
+				return err
+			}
+			select {
+			case <-done:
+				return nil
+			default:
 			}
 		}
-	}()
+	})
+
+	runTask(func() error {
+		for {
+			msg, err := client.Receive()
+			if err != nil {
+				return err
+			}
+			select {
+			case <-done:
+				return nil
+			case clientMsgs <- msg:
+			}
+			select {
+			case <-done:
+				return nil
+			case <-msgAck:
+			}
+		}
+	})
 
 	// Copy from client to server.
 	for {
-		msg, err := client.Receive()
-		if err != nil {
-			log.Error().Err(err).Msg("pgproxy.CopySteadyState: failed to receive message from client")
+		select {
+		case err := <-errChan:
 			return err
-		}
-		err = server.Send(msg)
-		if err != nil {
-			return err
-		}
-		if _, ok := msg.(*pgproto3.Terminate); ok {
-			log.Trace().Msg("received terminate from client, closing connection")
-			return nil
+		case msg := <-clientMsgs:
+			err := server.Send(msg)
+
+			if err != nil {
+				return err
+			}
+			if _, ok := msg.(*pgproto3.Terminate); ok {
+				log.Trace().Msg("received terminate from client, closing connection")
+				return nil
+			}
+			msgAck <- struct{}{}
 		}
 	}
 }

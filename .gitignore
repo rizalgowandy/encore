@@ -2,6 +2,7 @@
 /dist
 /encore
 /git-remote-encore
+/target
 
 # Don't commit dotfiles
 /.encore
@@ -12,3 +13,14 @@
 
 # JetBrains
 .idea
+.fleet
+.run
+
+# MacOS
+.DS_Store
+
+runtimes/supervisor-encore
+
+runtimes/supervisor-encore-linux-amd64
+
+encore-runtime.node-linux-amd64

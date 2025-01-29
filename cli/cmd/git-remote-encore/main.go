@@ -9,9 +9,10 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
-	"encr.dev/cli/internal/conf"
+	"encr.dev/internal/conf"
 )
 
 func main() {
@@ -20,6 +21,20 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+var isLocalTest = (func() bool {
+	return filepath.Base(os.Args[0]) == "git-remote-encorelocal"
+})()
+
+// remoteScheme is the remote scheme we expect.
+// It's "encore" in general but "encorelocal" for local development.
+var remoteScheme = (func() string {
+	if isLocalTest {
+		return "encorelocal"
+	} else {
+		return "encore"
+	}
+})()
 
 func run(args []string) error {
 	stdin := bufio.NewReader(os.Stdin)
@@ -52,12 +67,12 @@ func connect(args []string, svc string) error {
 	uri, err := url.Parse(args[2])
 	if err != nil {
 		return fmt.Errorf("connect %s: invalid remote uri: %v", os.Args[2], err)
-	} else if uri.Scheme != "encore" {
-		return fmt.Errorf("connect %s: expected remote scheme \"encore\", got %q", os.Args[2], uri.Scheme)
+	} else if uri.Scheme != remoteScheme {
+		return fmt.Errorf("connect %s: expected remote scheme %q, got %q", os.Args[2], remoteScheme, uri.Scheme)
 	}
 	appID := uri.Hostname()
 
-	ts := &conf.TokenSource{}
+	ts := conf.NewTokenSource()
 	tok, err := ts.Token()
 	if err != nil {
 		return fmt.Errorf("could not get Encore auth token: %v", err)
@@ -68,12 +83,13 @@ func connect(args []string, svc string) error {
 		return err
 	}
 	keyPath := f.Name()
-	defer os.Remove(keyPath)
+	defer func() { _ = os.Remove(keyPath) }()
+
 	if err := f.Chmod(0600); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	} else if _, err := f.Write([]byte(SentinelPrivateKey)); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	} else if err := f.Close(); err != nil {
 		return err
@@ -86,10 +102,15 @@ func connect(args []string, svc string) error {
 		return err
 	}
 	cfgPath := cfg.Name()
-	defer os.Remove(cfgPath)
+	defer func() { _ = os.Remove(cfgPath) }()
 
 	// Communicate to Git that the connection is established.
-	os.Stdout.Write([]byte("\n"))
+	_, _ = os.Stdout.Write([]byte("\n"))
+
+	sshServer, port := "git.encore.dev", "22"
+	if isLocalTest {
+		sshServer, port = "localhost", "9040"
+	}
 
 	// Set up an SSH tunnel with a sentinel key as a way to signal
 	// Encore to use token-based authentication, and pass the token
@@ -99,7 +120,8 @@ func connect(args []string, svc string) error {
 		"-F", cfgPath,
 		"-o", "IdentitiesOnly=yes",
 		"-i", keyPath,
-		"git.encore.dev",
+		"-p", port,
+		sshServer,
 		fmt.Sprintf("token=%s %s '%s'", tok.AccessToken, svc, appID))
 	cmd.Env = []string{}
 	cmd.Stdin = os.Stdin
@@ -114,6 +136,7 @@ func connect(args []string, svc string) error {
 //
 // NOTE: This is not a security problem. The key is meant to be public
 // and does not serve as a means of authentication.
+// nosemgrep
 const SentinelPrivateKey = `-----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
 QyNTUxOQAAACCyj3F5Tp1eBIp7rMohszumYzlys/BFfmX/LVkXJS8magAAAJjsp3yz7Kd8

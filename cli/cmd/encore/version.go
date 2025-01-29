@@ -4,17 +4,14 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
-	"runtime"
 	"strings"
 	"time"
 
 	"github.com/logrusorgru/aurora/v3"
 	"github.com/spf13/cobra"
-	"golang.org/x/mod/semver"
 
 	"encr.dev/cli/internal/update"
-	"encr.dev/cli/internal/version"
+	"encr.dev/internal/version"
 )
 
 var versionCmd = &cobra.Command{
@@ -24,7 +21,7 @@ var versionCmd = &cobra.Command{
 	DisableFlagsInUseLine: true,
 	Run: func(cmd *cobra.Command, args []string) {
 		var (
-			ver string
+			ver *update.LatestVersion
 			err error
 		)
 		if version.Version != "" {
@@ -33,11 +30,31 @@ var versionCmd = &cobra.Command{
 			ver, err = update.Check(ctx)
 		}
 
+		// NOTE: This output format is relied on by the Encore IntelliJ plugin.
+		// Don't change this without considering its impact on that plugin.
 		fmt.Fprintln(os.Stdout, "encore version", version.Version)
+
 		if err != nil {
 			fatalf("could not check for update: %v", err)
-		} else if semver.Compare(ver, version.Version) > 0 {
-			fmt.Println(aurora.Sprintf(aurora.Yellow("Update available: %s -> %s\nUpdate with: encore version update"), version.Version, ver))
+		} else if ver.IsNewer(version.Version) {
+			if ver.ForceUpgrade {
+				fmt.Println(aurora.Red("An urgent security update for Encore is available."))
+				if ver.SecurityNotes != "" {
+					fmt.Println(aurora.Sprintf(aurora.Yellow("%s"), ver.SecurityNotes))
+				}
+
+				versionUpdateCmd.Run(cmd, args)
+			} else {
+				if ver.SecurityUpdate {
+					fmt.Println(aurora.Sprintf(aurora.Red("A security update is update available: %s -> %s\nUpdate with: encore version update"), version.Version, ver.Version()))
+
+					if ver.SecurityNotes != "" {
+						fmt.Println(aurora.Sprintf(aurora.Yellow("%s"), ver.SecurityNotes))
+					}
+				} else {
+					fmt.Println(aurora.Sprintf(aurora.Yellow("Update available: %s -> %s\nUpdate with: encore version update"), version.Version, ver.Version()))
+				}
+			}
 		}
 	},
 }
@@ -49,7 +66,7 @@ var versionUpdateCmd = &cobra.Command{
 	DisableFlagsInUseLine: true,
 	Run: func(cmd *cobra.Command, args []string) {
 		if version.Version == "" || strings.HasPrefix(version.Version, "devel") {
-			fatal("cannot update development build, first install Encore from https://encore.dev/docs/intro/install")
+			fatal("cannot update development build, first install Encore from https://encore.dev/docs/install")
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -58,56 +75,18 @@ var versionUpdateCmd = &cobra.Command{
 		if err != nil {
 			fatalf("could not check for update: %v", err)
 		}
-		if semver.Compare(ver, version.Version) > 0 {
-			doUpgrade(ver)
+		if ver.IsNewer(version.Version) {
+			fmt.Printf("Upgrading Encore to %v...\n", ver.Version())
+
+			if err := ver.DoUpgrade(os.Stdout, os.Stderr); err != nil {
+				fatalf("could not update: %v", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
 		} else {
 			fmt.Println("Encore already up to date.")
 		}
 	},
-}
-
-// doUpgrade upgrades Encore.
-// Adapted from flyctl: https://github.com/superfly/flyctl
-func doUpgrade(ver string) {
-	fmt.Printf("Upgrading Encore to %v...\n", ver)
-
-	script := ""
-	switch runtime.GOOS {
-	case "windows":
-		script = "iwr https://encore.dev/install.ps1 -useb | iex"
-	case "darwin":
-		// Was it installed via brew?
-		if _, err := exec.LookPath("brew"); err == nil {
-			script = "brew upgrade encore"
-		} else {
-			script = "curl -L \"https://encore.dev/install.sh\" | sh"
-		}
-	default:
-		script = "curl -L \"https://encore.dev/install.sh\" | sh"
-	}
-
-	arg := "-c"
-	shell, ok := os.LookupEnv("SHELL")
-	if !ok {
-		if runtime.GOOS == "windows" {
-			shell = "powershell.exe"
-			arg = "-Command"
-		} else {
-			shell = "/bin/bash"
-		}
-	}
-	fmt.Println("Running update [" + script + "]")
-	cmd := exec.Command(shell, arg, script)
-
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	err := cmd.Run()
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-	os.Exit(0)
 }
 
 func init() {

@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"encr.dev/pkg/xos"
 )
 
 type Event struct {
@@ -14,8 +16,20 @@ type Event struct {
 }
 
 type State struct {
-	FirstRun   Event `json:"first_run"`
-	DeployHint Event `json:"deploy_hint"`
+	FirstRun   Event             `json:"first_run"`
+	DeployHint Event             `json:"deploy_hint"`
+	EventMap   map[string]*Event `json:"carousel"`
+}
+
+func (e *State) Property(prop string) *Event {
+	if e.EventMap == nil {
+		e.EventMap = map[string]*Event{}
+	}
+	_, ok := e.EventMap[prop]
+	if !ok {
+		e.EventMap[prop] = &Event{}
+	}
+	return e.EventMap[prop]
 }
 
 func (e *Event) IsSet() bool {
@@ -31,7 +45,7 @@ func (e *Event) Set() bool {
 }
 
 func Load() (*State, error) {
-	cfg := &State{}
+	cfg := &State{EventMap: map[string]*Event{}}
 	path, err := configPath()
 	if err != nil {
 		return cfg, err
@@ -45,6 +59,13 @@ func Load() (*State, error) {
 		return cfg, err
 	}
 	err = json.Unmarshal(data, &cfg)
+	if err != nil {
+		return cfg, err
+	}
+
+	if cfg.FirstRun.IsSet() && time.Since(cfg.FirstRun.Time) > 14*24*time.Hour {
+		cfg.Property("carousel").Set()
+	}
 	return cfg, err
 }
 
@@ -59,7 +80,7 @@ func (cfg *State) Write() error {
 	} else if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return xos.WriteFile(path, data, 0644)
 }
 
 func configPath() (string, error) {

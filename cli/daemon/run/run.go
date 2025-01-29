@@ -6,41 +6,44 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/binary"
 	"fmt"
-	"io"
-	"io/ioutil"
-	mathrand "math/rand"
 	"net"
 	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
+	"net/netip"
+	"runtime"
+	"slices"
 	"sort"
-	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/errors"
+	"github.com/logrusorgru/aurora/v3"
 	"github.com/rs/xid"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	"golang.org/x/mod/modfile"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+	"golang.org/x/sync/errgroup"
 
-	"github.com/hashicorp/yamux"
-
-	encore "encore.dev"
-	"encore.dev/runtime/config"
+	"encore.dev/appruntime/exported/config"
+	"encore.dev/appruntime/exported/experiments"
 	"encr.dev/cli/daemon/apps"
-	"encr.dev/cli/daemon/internal/sym"
-	"encr.dev/cli/daemon/pubsub"
-	"encr.dev/cli/daemon/sqldb"
-	"encr.dev/cli/internal/env"
-	"encr.dev/cli/internal/version"
-	"encr.dev/cli/internal/xos"
-	"encr.dev/compiler"
+	"encr.dev/cli/daemon/namespace"
+	"encr.dev/cli/daemon/run/infra"
+	"encr.dev/cli/daemon/secret"
 	"encr.dev/internal/optracker"
-	"encr.dev/parser"
+	"encr.dev/internal/userconfig"
+	"encr.dev/internal/version"
+	"encr.dev/pkg/builder"
+	"encr.dev/pkg/builder/builderimpl"
+	"encr.dev/pkg/cueutil"
+	"encr.dev/pkg/option"
+	"encr.dev/pkg/promise"
+	"encr.dev/pkg/svcproxy"
 	"encr.dev/pkg/vcs"
+	daemonpb "encr.dev/proto/encore/daemon"
 	meta "encr.dev/proto/encore/parser/meta/v1"
 )
 
@@ -49,22 +52,29 @@ type Run struct {
 	ID              string // unique ID for this instance of the running app
 	App             *apps.Instance
 	ListenAddr      string // the address the app is listening on
-	ResourceServers *ResourceServices
+	SvcProxy        *svcproxy.SvcProxy
+	ResourceManager *infra.ResourceManager
+	NS              *namespace.Namespace
 
+	Builder builder.Impl
 	log     zerolog.Logger
-	mgr     *Manager
-	params  *StartParams
+	Mgr     *Manager
+	Params  *StartParams
+	secrets *secret.LoadResult
+
 	ctx     context.Context // ctx is closed when the run is to exit
 	proc    atomic.Value    // current process
 	exited  chan struct{}   // exit is closed when the run has fully exited
 	started chan struct{}   // started is closed once the run has fully started
-
 }
 
 // StartParams groups the parameters for the Run method.
 type StartParams struct {
 	// App is the app to start.
 	App *apps.Instance
+
+	// NS is the namespace to use.
+	NS *namespace.Namespace
 
 	// WorkingDir is the working dir, for formatting
 	// error messages with relative paths.
@@ -82,28 +92,89 @@ type StartParams struct {
 
 	// The Ops tracker being used for this run
 	OpsTracker *optracker.OpTracker
+
+	// Browser specifies the browser mode to use.
+	Browser BrowserMode
+
+	// Debug specifies to compile the application for debugging.
+	Debug builder.DebugMode
+}
+
+// BrowserMode specifies how to open the browser when starting 'encore run'.
+type BrowserMode int
+
+const (
+	BrowserModeAuto   BrowserMode = iota // open if not already open
+	BrowserModeNever                     // never open
+	BrowserModeAlways                    // always open
+)
+
+func BrowserModeFromConfig(cfg *userconfig.Config) BrowserMode {
+	switch cfg.RunBrowser {
+	case "never":
+		return BrowserModeNever
+	case "always":
+		return BrowserModeAlways
+	default:
+		return BrowserModeAuto
+	}
+}
+
+func BrowserModeFromProto(b daemonpb.RunRequest_BrowserMode) BrowserMode {
+	switch b {
+	case daemonpb.RunRequest_BROWSER_AUTO:
+		return BrowserModeAuto
+	case daemonpb.RunRequest_BROWSER_NEVER:
+		return BrowserModeNever
+	case daemonpb.RunRequest_BROWSER_ALWAYS:
+		return BrowserModeAlways
+	default:
+		return BrowserModeAuto
+	}
+}
+
+func DebugModeFromProto(d daemonpb.RunRequest_DebugMode) builder.DebugMode {
+	switch d {
+	case daemonpb.RunRequest_DEBUG_DISABLED:
+		return builder.DebugModeDisabled
+	case daemonpb.RunRequest_DEBUG_ENABLED:
+		return builder.DebugModeEnabled
+	case daemonpb.RunRequest_DEBUG_BREAK:
+		return builder.DebugModeBreak
+	default:
+		return builder.DebugModeDisabled
+	}
 }
 
 // Start starts the application.
 // Its lifetime is bounded by ctx.
 func (mgr *Manager) Start(ctx context.Context, params StartParams) (run *Run, err error) {
-	run = &Run{
-		ID:              genID(),
-		App:             params.App,
-		ResourceServers: newResourceServices(params.App, mgr.ClusterMgr),
-		ListenAddr:      params.ListenAddr,
+	logger := log.With().Str("app_id", params.App.PlatformOrLocalID()).Logger()
 
-		log:     log.With().Str("app_id", params.App.PlatformOrLocalID()).Logger(),
-		mgr:     mgr,
-		params:  &params,
-		ctx:     ctx,
-		exited:  make(chan struct{}),
-		started: make(chan struct{}),
+	svcProxy, err := svcproxy.New(ctx, logger)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create service proxy")
+	}
+
+	run = &Run{
+		ID:              GenID(),
+		App:             params.App,
+		NS:              params.NS,
+		ResourceManager: infra.NewResourceManager(params.App, mgr.ClusterMgr, mgr.ObjectsMgr, mgr.PublicBuckets, params.NS, params.Environ, mgr.DBProxyPort, false),
+		ListenAddr:      params.ListenAddr,
+		SvcProxy:        svcProxy,
+		log:             logger,
+		Mgr:             mgr,
+		Params:          &params,
+		secrets:         mgr.Secret.Load(params.App),
+		ctx:             ctx,
+		exited:          make(chan struct{}),
+		started:         make(chan struct{}),
 	}
 	defer func(r *Run) {
 		// Stop all the resource servers if we exit due to an error
 		if err != nil {
-			r.ResourceServers.StopAll()
+			r.Close()
 		}
 	}(run)
 
@@ -117,6 +188,9 @@ func (mgr *Manager) Start(ctx context.Context, params StartParams) (run *Run, er
 	mgr.mu.Unlock()
 
 	if err := run.start(params.Listener, params.OpsTracker); err != nil {
+		if errList := AsErrorList(err); errList != nil {
+			return nil, errList
+		}
 		return nil, err
 	}
 
@@ -129,19 +203,37 @@ func (mgr *Manager) Start(ctx context.Context, params StartParams) (run *Run, er
 	return run, nil
 }
 
-// runLogger is the interface for listening to run logs.
-// The log methods are called for each logline on stdout and stderr respectively.
-type runLogger interface {
-	runStdout(r *Run, line []byte)
-	runStderr(r *Run, line []byte)
+func (r *Run) Close() {
+	if r.Builder != nil {
+		_ = r.Builder.Close()
+	}
+	r.SvcProxy.Close()
+	r.ResourceManager.StopAll()
 }
 
-// Proc returns the current running process.
+// RunLogger is the interface for listening to run logs.
+// The log methods are called for each logline on stdout and stderr respectively.
+type RunLogger interface {
+	RunStdout(r *Run, line []byte)
+	RunStderr(r *Run, line []byte)
+}
+
+// ProcGroup returns the current running process.
 // It may have already exited.
 // If the proc has not yet started it may return nil.
-func (r *Run) Proc() *Proc {
-	p, _ := r.proc.Load().(*Proc)
+//
+// If run is nil then nil will be returned
+func (r *Run) ProcGroup() *ProcGroup {
+	if r == nil {
+		return nil
+	}
+
+	p, _ := r.proc.Load().(*ProcGroup)
 	return p
+}
+
+func (r *Run) StoreProc(p *ProcGroup) {
+	r.proc.Store(p)
 }
 
 // Done returns a channel that is closed when the run is closed.
@@ -152,12 +244,12 @@ func (r *Run) Done() <-chan struct{} {
 // Reload rebuilds the app and, if successful,
 // starts a new proc and switches over.
 func (r *Run) Reload() error {
-	err := r.buildAndStart(r.ctx, nil)
+	err := r.buildAndStart(r.ctx, nil, true)
 	if err != nil {
 		return err
 	}
 
-	for _, ln := range r.mgr.listeners {
+	for _, ln := range r.Mgr.listeners {
 		ln.OnReload(r)
 	}
 
@@ -175,44 +267,49 @@ func (r *Run) start(ln net.Listener, tracker *optracker.OpTracker) (err error) {
 		}
 	}()
 
-	err = r.buildAndStart(r.ctx, tracker)
+	err = r.buildAndStart(r.ctx, tracker, false)
 	if err != nil {
 		return err
 	}
 
 	// Below this line the function must never return an error
-	// in order to only ensure we close r.exited exactly once.
+	// in order to only ensure we Close r.exited exactly once.
 
 	go func() {
-		for _, ln := range r.mgr.listeners {
+		for _, ln := range r.Mgr.listeners {
 			ln.OnStart(r)
 		}
 		close(r.started)
 	}()
 
+	// Wrap the handler with h2c support to enable HTTP/2 in cleartext
+	// (the std http library only accepts HTTP/2 over TLS).
+	// We need this to be able to forward e.g. gRPC requests to the app.
+	handler := h2c.NewHandler(r, &http2.Server{})
+
 	// Run the http server until the app exits.
-	srv := &http.Server{Addr: ln.Addr().String(), Handler: r}
+	srv := &http.Server{Addr: ln.Addr().String(), Handler: handler}
 	go func() {
-		if err := srv.Serve(ln); err != http.ErrServerClosed {
+		if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
 			r.log.Error().Err(err).Msg("could not serve")
 		}
 	}()
 	go func() {
 		<-r.ctx.Done()
-		srv.Close()
+		_ = srv.Close()
 	}()
 
-	// Monitor the running proc and close the app when it exits.
+	// Monitor the running proc and Close the app when it exits.
 	go func() {
 		for {
-			p := r.proc.Load().(*Proc)
+			p := r.proc.Load().(*ProcGroup)
 			<-p.Done()
 			// p exited, but it could have been a reload.
 			// Check to make sure p is still the active proc.
-			p2 := r.proc.Load().(*Proc)
+			p2 := r.proc.Load().(*ProcGroup)
 			if p2 == p {
 				// We're done.
-				for _, ln := range r.mgr.listeners {
+				for _, ln := range r.Mgr.listeners {
 					ln.OnStop(r)
 				}
 				close(r.exited)
@@ -223,94 +320,117 @@ func (r *Run) start(ln net.Listener, tracker *optracker.OpTracker) (err error) {
 	return nil
 }
 
-// parseApp parses the app and returns the parse result.
-func (r *Run) parseApp() (*parser.Result, error) {
-	modPath := filepath.Join(r.App.Root(), "go.mod")
-	modData, err := ioutil.ReadFile(modPath)
-	if err != nil {
-		return nil, err
-	}
-	mod, err := modfile.Parse(modPath, modData, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	vcsRevision := vcs.GetRevision(r.App.Root())
-
-	cfg := &parser.Config{
-		AppRoot:                  r.App.Root(),
-		AppRevision:              vcsRevision.Revision,
-		AppHasUncommittedChanges: vcsRevision.Uncommitted,
-		ModulePath:               mod.Module.Mod.Path,
-		WorkingDir:               r.params.WorkingDir,
-		ParseTests:               false,
-	}
-
-	return parser.Parse(cfg)
-}
-
 // buildAndStart builds the app, starts the proc, and cleans up
 // the build dir when it exits.
 // The proc exits when ctx is canceled.
-func (r *Run) buildAndStart(ctx context.Context, tracker *optracker.OpTracker) error {
+func (r *Run) buildAndStart(ctx context.Context, tracker *optracker.OpTracker, isReload bool) error {
 	// Return early if the ctx is already canceled.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	jobs := newAsyncBuildJobs(ctx, r.App.PlatformOrLocalID(), tracker)
+	for _, ln := range r.Mgr.listeners {
+		ln.OnCompileStart(r)
+	}
+
+	jobs := optracker.NewAsyncBuildJobs(ctx, r.App.PlatformOrLocalID(), tracker)
 
 	// Parse the app source code
 	// Parse the app to figure out what infrastructure is needed.
 	start := time.Now()
 	parseOp := tracker.Add("Building Encore application graph", start)
 	topoOp := tracker.Add("Analyzing service topology", start)
-	parse, err := r.parseApp()
+
+	expSet, err := r.App.Experiments(r.Params.Environ)
 	if err != nil {
-		tracker.Fail(parseOp, err)
 		return err
+	}
+
+	if r.Builder == nil {
+		r.Builder = builderimpl.Resolve(r.App.Lang(), expSet)
+	}
+
+	vcsRevision := vcs.GetRevision(r.App.Root())
+	buildInfo := builder.BuildInfo{
+		BuildTags:          builder.LocalBuildTags,
+		CgoEnabled:         true,
+		StaticLink:         false,
+		DebugMode:          r.Params.Debug,
+		Environ:            r.Params.Environ,
+		GOOS:               runtime.GOOS,
+		GOARCH:             runtime.GOARCH,
+		KeepOutput:         false,
+		Revision:           vcsRevision.Revision,
+		UncommittedChanges: vcsRevision.Uncommitted,
+
+		// Use the local JS runtime if this is a development build.
+		UseLocalJSRuntime: version.Channel == version.DevBuild,
+	}
+
+	// A context that is canceled when the proc exits.
+	procCtx, cancelProcCtx := context.WithCancel(ctx)
+
+	// Cancel the proc context if we exit with a non-nil error.
+	defer func() {
+		if err != nil {
+			cancelProcCtx()
+		}
+	}()
+
+	parse, err := r.Builder.Parse(procCtx, builder.ParseParams{
+		Build:       buildInfo,
+		App:         r.App,
+		Experiments: expSet,
+		WorkingDir:  r.Params.WorkingDir,
+		ParseTests:  false,
+	})
+	if err != nil {
+		// Don't use the error itself in tracker.Fail, as it will lead to duplicate error output.
+		tracker.Fail(parseOp, errors.New("parse error"))
+		return err
+	}
+
+	if err := r.App.CacheMetadata(parse.Meta); err != nil {
+		return errors.Wrap(err, "cache metadata")
 	}
 	tracker.Done(parseOp, 500*time.Millisecond)
 	tracker.Done(topoOp, 300*time.Millisecond)
 
-	if err := r.ResourceServers.StartRequiredServices(jobs, parse); err != nil {
-		return err
-	}
+	r.ResourceManager.StartRequiredServices(jobs, parse.Meta)
 
-	var build *compiler.Result
+	configProm := promise.New(func() (*builder.ServiceConfigsResult, error) {
+		return r.Builder.ServiceConfigs(ctx, builder.ServiceConfigsParams{
+			Parse: parse,
+			CueMeta: &cueutil.Meta{
+				APIBaseURL: fmt.Sprintf("http://%s", r.ListenAddr),
+				EnvName:    "local",
+				EnvType:    cueutil.EnvType_Development,
+				CloudType:  cueutil.CloudType_Local,
+			},
+		})
+	})
+
+	var build *builder.CompileResult
 	jobs.Go("Compiling application source code", false, 0, func(ctx context.Context) (err error) {
-		cfg := &compiler.Config{
-			Revision:              parse.Meta.AppRevision,
-			UncommittedChanges:    parse.Meta.UncommittedChanges,
-			WorkingDir:            r.params.WorkingDir,
-			CgoEnabled:            true,
-			EncoreCompilerVersion: fmt.Sprintf("EncoreCLI/%s", version.Version),
-			EncoreRuntimePath:     env.EncoreRuntimePath(),
-			EncoreGoRoot:          env.EncoreGoRoot(),
-			Parse:                 parse,
-			BuildTags:             []string{"encore_local"},
-			OpTracker:             tracker,
-		}
-
-		build, err = compiler.Build(r.App.Root(), cfg)
+		build, err = r.Builder.Compile(ctx, builder.CompileParams{
+			Build:       buildInfo,
+			App:         r.App,
+			Parse:       parse,
+			OpTracker:   tracker,
+			Experiments: expSet,
+			WorkingDir:  r.Params.WorkingDir,
+			Environ:     r.Params.Environ,
+		})
 		if err != nil {
-			return fmt.Errorf("compile error:\n%v", err)
+			return errors.Wrap(err, "compile error")
 		}
 		return nil
 	})
-	defer func() {
-		if err != nil && build != nil {
-			os.RemoveAll(build.Dir)
-		}
-	}()
 
 	var secrets map[string]string
 	if usesSecrets(parse.Meta) {
 		jobs.Go("Fetching application secrets", true, 150*time.Millisecond, func(ctx context.Context) error {
-			if r.App.PlatformID() == "" {
-				return fmt.Errorf("the app defines secrets, but is not yet linked to encore.dev; link it with `encore app link` to use secrets")
-			}
-			data, err := r.mgr.Secret.Get(ctx, r.App.PlatformID())
+			data, err := r.secrets.Get(ctx, expSet)
 			if err != nil {
 				return err
 			}
@@ -323,349 +443,245 @@ func (r *Run) buildAndStart(ctx context.Context, tracker *optracker.OpTracker) e
 		return err
 	}
 
+	svcCfg, err := configProm.Get(ctx)
+	if err != nil {
+		return err
+	}
+
 	startOp := tracker.Add("Starting Encore application", start)
-	newProcess, err := r.startProc(&startProcParams{
-		Ctx:          ctx,
-		BuildDir:     build.Dir,
-		BinPath:      build.Exe,
-		Meta:         build.Parse.Meta,
-		Logger:       r.mgr,
-		RuntimePort:  r.mgr.RuntimePort,
-		DBProxyPort:  r.mgr.DBProxyPort,
-		SQLDBCluster: r.ResourceServers.GetSQLCluster(),
-		NSQDaemon:    r.ResourceServers.GetPubSub(),
-		Secrets:      secrets,
-		Environ:      r.params.Environ,
+	newProcess, err := r.StartProcGroup(&StartProcGroupParams{
+		Ctx:            ctx,
+		Outputs:        build.Outputs,
+		Meta:           parse.Meta,
+		Logger:         r.Mgr,
+		Secrets:        secrets,
+		ServiceConfigs: svcCfg.Configs,
+		Environ:        r.Params.Environ,
+		WorkingDir:     r.Params.WorkingDir,
+		IsReload:       isReload,
+		Experiments:    expSet,
 	})
 	if err != nil {
 		tracker.Fail(startOp, err)
 		return err
 	}
+
+	// Close the proc context when the proc exits.
 	go func() {
-		<-newProcess.Done()
-		os.RemoveAll(build.Dir)
+		select {
+		case <-procCtx.Done():
+		// Already done
+		case <-newProcess.Done():
+			cancelProcCtx()
+		}
 	}()
 
 	previousProcess := r.proc.Swap(newProcess)
 	if previousProcess != nil {
-		previousProcess.(*Proc).close()
+		previousProcess.(*ProcGroup).Close()
 	}
 
 	tracker.Done(startOp, 50*time.Millisecond)
 
+	go func() {
+		// Wait one second before logging all the missing secrets.
+		time.Sleep(1 * time.Second)
+
+		// Log any warnings.
+		for _, warning := range newProcess.Warnings() {
+			line := "\n" + aurora.Red(fmt.Sprintf("warning: %s", warning.Title)).String() + "\n" +
+				aurora.Gray(16, fmt.Sprintf("note: %s", warning.Help)).String() + "\n\n"
+			r.Mgr.RunStderr(r, []byte(line))
+		}
+	}()
+
 	return nil
 }
 
-// Proc represents a running Encore process.
-type Proc struct {
-	ID      string     // unique process id
-	Run     *Run       // the run the process belongs to
-	Pid     int        // the OS process id
-	Meta    *meta.Data // app metadata snapshot
-	Started time.Time  // when the process started
-
-	ctx      context.Context
-	log      zerolog.Logger
-	exit     chan struct{} // closed when the process has exited
-	cmd      *exec.Cmd
-	reqWr    *os.File
-	respRd   *os.File
-	buildDir string
-	client   *yamux.Session
-	authKey  config.EncoreAuthKey
-
-	sym       *sym.Table
-	symErr    error
-	symParsed chan struct{} // closed when sym and symErr are set
+type StartProcGroupParams struct {
+	Ctx            context.Context
+	Outputs        []builder.BuildOutput
+	Meta           *meta.Data
+	Secrets        map[string]string
+	ServiceConfigs map[string]string
+	Logger         RunLogger
+	Environ        []string
+	WorkingDir     string
+	IsReload       bool
+	Experiments    *experiments.Set
 }
 
-type startProcParams struct {
-	Ctx          context.Context
-	BuildDir     string
-	BinPath      string
-	Meta         *meta.Data
-	Secrets      map[string]string
-	RuntimePort  int
-	DBProxyPort  int
-	SQLDBCluster *sqldb.Cluster    // nil means no cluster
-	NSQDaemon    *pubsub.NSQDaemon // nil means no pubsub
-	Logger       runLogger
-	Environ      []string
-}
+const gracefulShutdownTime = 10 * time.Second
 
-// startProc starts a single actual OS process for app.
-func (r *Run) startProc(params *startProcParams) (p *Proc, err error) {
-	pid := genID()
-	authKey := genAuthKey()
-	p = &Proc{
-		ID:        pid,
-		Run:       r,
-		Meta:      params.Meta,
-		ctx:       params.Ctx,
-		exit:      make(chan struct{}),
-		buildDir:  params.BuildDir,
-		log:       r.log.With().Str("proc_id", pid).Str("build_dir", params.BuildDir).Logger(),
-		symParsed: make(chan struct{}),
-		authKey:   authKey,
-	}
-	go p.parseSymTable(params.BinPath)
+// StartProcGroup starts a single actual OS process for app.
+func (r *Run) StartProcGroup(params *StartProcGroupParams) (p *ProcGroup, err error) {
+	pid := GenID()
 
-	runtimeCfg := r.generateConfig(p, params)
-	runtimeJSON, _ := json.Marshal(runtimeCfg)
+	userEnv := append([]string{
+		"ENCORE_RUNTIME_LOG=error",
+		// Always include internal messages when developing locally.
+		"ENCORE_INCLUDE_INTERNAL_MESSAGE_ERRORS=1",
+	}, params.Environ...)
 
-	cmd := exec.Command(params.BinPath)
-	cmd.Env = append(params.Environ,
-		"ENCORE_RUNTIME_CONFIG="+base64.RawURLEncoding.EncodeToString(runtimeJSON),
-		"ENCORE_APP_SECRETS="+encodeSecretsEnv(params.Secrets),
-	)
-	p.cmd = cmd
-
-	// Proxy stdout and stderr to the given app logger, if any.
-	if l := params.Logger; l != nil {
-		cmd.Stdout = newLogWriter(r, l.runStdout)
-		cmd.Stderr = newLogWriter(r, l.runStderr)
-	}
-
-	// Set up extra file descriptors for communicating requests/responses:
-	// - reqRd is for reading incoming requests (handed over procchild)
-	// - reqWr is for writing incoming requests
-	// - respRd is for reading responses
-	// - respWr is for writing responses (handed over to proc)
-	reqRd, reqWr, err1 := os.Pipe()
-	respRd, respWr, err2 := os.Pipe()
-	defer func() {
-		// Close all the files if we return an error.
-		if err != nil {
-			closeAll(reqRd, reqWr, respRd, respWr)
-		}
-	}()
-	if err := firstErr(err1, err2); err != nil {
-		return nil, err
-	} else if err := xos.ArrangeExtraFiles(cmd, reqRd, respWr); err != nil {
-		return nil, err
-	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	p.log.Info().Msg("started process")
-	defer func() {
-		if err != nil {
-			cmd.Process.Kill()
-		}
-	}()
-
-	// Close the files we handed over to the child.
-	closeAll(reqRd, respWr)
-
-	rwc := &struct {
-		io.ReadCloser
-		io.Writer
-	}{
-		ReadCloser: ioutil.NopCloser(respRd),
-		Writer:     reqWr,
-	}
-	p.client, err = yamux.Client(rwc, yamux.DefaultConfig())
+	daemonProxyAddr, err := netip.ParseAddrPort(strings.ReplaceAll(r.ListenAddr, "localhost", "127.0.0.1"))
 	if err != nil {
-		return nil, fmt.Errorf("could not initialize connection: %v", err)
+		return nil, errors.Wrapf(err, "failed to parse listen address: %s", r.ListenAddr)
 	}
-
-	p.reqWr = reqWr
-	p.respRd = respRd
-	p.Pid = cmd.Process.Pid
-	p.Started = time.Now()
-
-	// Monitor the context and close the process when it is done.
-	go func() {
-		select {
-		case <-params.Ctx.Done():
-			p.close()
-		case <-p.exit:
-		}
-	}()
-
-	go p.waitForExit()
-	return p, nil
-}
-
-func (r *Run) generateConfig(p *Proc, params *startProcParams) *config.Runtime {
-	var (
-		sqlServers []*config.SQLServer
-		sqlDBs     []*config.SQLDatabase
-	)
-	if params.SQLDBCluster != nil {
-		srv := &config.SQLServer{
-			Host: "localhost:" + strconv.Itoa(params.DBProxyPort),
-		}
-		sqlServers = append(sqlServers, srv)
-
-		for _, svc := range params.Meta.Svcs {
-			if len(svc.Migrations) > 0 {
-				sqlDBs = append(sqlDBs, &config.SQLDatabase{
-					EncoreName:   svc.Name,
-					DatabaseName: svc.Name,
-					User:         "encore",
-					Password:     params.SQLDBCluster.Password,
-				})
-			}
-		}
-
-		// Configure max connections based on 96 connections
-		// divided evenly among the databases
-		maxConns := 96 / len(sqlDBs)
-		for _, db := range sqlDBs {
-			db.MaxConnections = maxConns
+	gatewayBaseURL := fmt.Sprintf("http://%s", daemonProxyAddr)
+	gateways := make(map[string]GatewayConfig)
+	for _, gw := range params.Meta.Gateways {
+		gateways[gw.EncoreName] = GatewayConfig{
+			BaseURL:   gatewayBaseURL,
+			Hostnames: []string{"localhost"},
 		}
 	}
 
-	var (
-		pubsubProviders []*config.PubsubProvider
-		pubsubTopics    map[string]*config.PubsubTopic
-	)
-	if params.NSQDaemon != nil {
-		p := &config.PubsubProvider{
-			NSQ: &config.NSQProvider{
-				Host: params.NSQDaemon.Addr(),
-			},
-		}
-		pubsubProviders = append(pubsubProviders, p)
-		pubsubTopics = make(map[string]*config.PubsubTopic)
-		for _, t := range params.Meta.PubsubTopics {
-			topicCfg := &config.PubsubTopic{
-				EncoreName:    t.Name,
-				ProviderID:    0,
-				ProviderName:  t.Name,
-				Subscriptions: make(map[string]*config.PubsubSubscription),
-			}
-
-			if t.OrderingKey != "" {
-				topicCfg.OrderingKey = t.OrderingKey
-			}
-
-			for _, s := range t.Subscriptions {
-				topicCfg.Subscriptions[s.Name] = &config.PubsubSubscription{
-					ID:           s.Name,
-					EncoreName:   s.Name,
-					ProviderName: s.Name,
-				}
-			}
-
-			pubsubTopics[t.Name] = topicCfg
-		}
-	}
-
-	return &config.Runtime{
-		AppID:           r.ID,
-		AppSlug:         r.App.PlatformID(),
-		APIBaseURL:      "http://" + r.ListenAddr,
-		DeployID:        fmt.Sprintf("run_%s", xid.New()),
-		DeployedAt:      time.Now().UTC(), // Force UTC to not cause confusion
-		EnvID:           p.ID,
-		EnvName:         "local",
-		EnvCloud:        string(encore.CloudLocal),
-		EnvType:         string(encore.EnvLocal),
-		TraceEndpoint:   "http://localhost:" + strconv.Itoa(params.RuntimePort) + "/trace",
-		SQLDatabases:    sqlDBs,
-		SQLServers:      sqlServers,
-		PubsubProviders: pubsubProviders,
-		PubsubTopics:    pubsubTopics,
-		AuthKeys:        []config.EncoreAuthKey{p.authKey},
-		CORS: &config.CORS{
-			AllowOriginsWithCredentials: []string{
-				// Allow all origins with credentials for local development;
-				// since it's only running on localhost for development this is safe.
-				config.UnsafeAllOriginWithCredentials,
-			},
-
-			AllowOriginsWithoutCredentials: []string{"*"},
+	authKey := genAuthKey()
+	p = newProcGroup(procGroupOptions{
+		ProcID:  pid,
+		Run:     r,
+		AuthKey: authKey,
+		ConfigGen: &RuntimeConfigGenerator{
+			app:            r.App,
+			infraManager:   r.ResourceManager,
+			md:             params.Meta,
+			AppID:          option.Some(r.ID),
+			EnvID:          option.Some(pid),
+			TraceEndpoint:  option.Some(fmt.Sprintf("http://localhost:%d/trace", r.Mgr.RuntimePort)),
+			AuthKey:        authKey,
+			Gateways:       gateways,
+			DefinedSecrets: params.Secrets,
+			SvcConfigs:     params.ServiceConfigs,
+			DeployID:       option.Some(fmt.Sprintf("run_%s", xid.New().String())),
+			IncludeMetaEnv: r.Builder.NeedsMeta(),
 		},
-	}
-}
+		Experiments: params.Experiments,
+		Meta:        params.Meta,
+		Ctx:         params.Ctx,
+		WorkingDir:  params.WorkingDir,
+		Logger:      params.Logger,
+	})
 
-// Done returns a channel that is closed when the process has exited.
-func (p *Proc) Done() <-chan struct{} {
-	return p.exit
-}
-
-// close closes the process and waits for it to shutdown.
-// It can safely be called multiple times.
-func (p *Proc) close() {
-	p.reqWr.Close()
-	timer := time.NewTimer(10 * time.Second)
-	defer timer.Stop()
-	select {
-	case <-p.exit:
-	case <-timer.C:
-		// The process didn't exit after 10s
-		p.log.Error().Msg("timed out waiting for process to exit; killing")
-		p.cmd.Process.Kill()
-		<-p.exit
-	}
-}
-
-func (p *Proc) waitForExit() {
-	defer close(p.exit)
-	defer closeAll(p.reqWr, p.respRd)
-
-	if err := p.cmd.Wait(); err != nil && p.ctx.Err() == nil {
-		p.log.Error().Err(err).Msg("process exited with error")
-	} else {
-		p.log.Info().Msg("process exited successfully")
-	}
-
-	// Flush the logs in case the output did not end in a newline.
-	for _, w := range [...]io.Writer{p.cmd.Stdout, p.cmd.Stderr} {
-		if w != nil {
-			w.(*logWriter).Flush()
-		}
-	}
-}
-
-// parseSymTable parses the symbol table of the binary at binPath
-// and stores the result in p.sym and p.symErr.
-func (p *Proc) parseSymTable(binPath string) {
-	parse := func() (*sym.Table, error) {
-		f, err := os.Open(binPath)
+	if isSingleProc(params.Outputs) {
+		conf, err := p.ConfigGen.AllInOneProc()
 		if err != nil {
 			return nil, err
 		}
-		defer f.Close()
-		return sym.Load(f)
-	}
 
-	defer close(p.symParsed)
-	p.sym, p.symErr = parse()
-}
+		entrypoint := params.Outputs[0].GetEntrypoints()[0]
 
-// SymTable waits for the proc's symbol table to be parsed and then returns it.
-// ctx is used to cancel the wait.
-func (p *Proc) SymTable(ctx context.Context) (*sym.Table, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-p.symParsed:
-		return p.sym, p.symErr
-	}
-}
-
-// closeAll closes all the given closers, skipping ones that are nil.
-func closeAll(closers ...io.Closer) {
-	for _, c := range closers {
-		if c != nil {
-			c.Close()
-		}
-	}
-}
-
-// firstErr reports the first non-nil error out of errs.
-// If all are nil, it reports nil.
-func firstErr(errs ...error) error {
-	for _, err := range errs {
+		// Generate the environmental variables for the process
+		procEnv, err := p.ConfigGen.ProcEnvs(conf, entrypoint.UseRuntimeConfigV2)
 		if err != nil {
-			return err
+			return nil, errors.Wrap(err, "failed to generate environment variables")
+		}
+
+		env := slices.Clone(userEnv)
+		env = append(env, procEnv...)
+
+		// Otherwise we're running everything inside a single process
+		cmd := entrypoint.Cmd.Expand(params.Outputs[0].GetArtifactDir())
+		if err := p.NewAllInOneProc(cmd, conf.ListenAddr, env); err != nil {
+			return nil, err
+		}
+	} else {
+		var (
+			svcConfs map[string]*ProcConfig
+			gwConfs  map[string]*ProcConfig
+		)
+
+		if r.Builder.UseNewRuntimeConfig() {
+			_, svcConfs, gwConfs, err = p.ConfigGen.ProcPerServiceWithNewRuntimeConfig(r.SvcProxy)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			svcConfs, gwConfs, err = p.ConfigGen.ProcPerService(r.SvcProxy)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		for _, o := range params.Outputs {
+			for _, ep := range o.GetEntrypoints() {
+				cmd := ep.Cmd.Expand(o.GetArtifactDir())
+				// create a process for each service
+				for _, svcName := range ep.Services {
+					// Generate the environmental variables for the process
+					procConf, ok := svcConfs[svcName]
+					if !ok {
+						return nil, errors.Newf("unknown service %q", svcName)
+					}
+					procEnv, err := p.ConfigGen.ProcEnvs(procConf, ep.UseRuntimeConfigV2)
+					if err != nil {
+						return nil, errors.Wrap(err, "failed to generate environment variables")
+					}
+
+					env := slices.Clone(userEnv)
+					env = append(env, procEnv...)
+
+					if err := p.NewProcForService(svcName, procConf.ListenAddr, cmd, env); err != nil {
+						return nil, err
+					}
+				}
+
+				for _, gwName := range ep.Gateways {
+					procConf, ok := gwConfs[gwName]
+					if !ok {
+						return nil, errors.Newf("unknown gateway %q", gwName)
+					}
+
+					procEnv, err := p.ConfigGen.ProcEnvs(procConf, ep.UseRuntimeConfigV2)
+					if err != nil {
+						return nil, errors.Wrap(err, "failed to generate environment variables")
+					}
+
+					env := slices.Clone(userEnv)
+					env = append(env, procEnv...)
+
+					if err := p.NewProcForGateway(gwName, procConf.ListenAddr, cmd, env); err != nil {
+						return nil, err
+					}
+				}
+			}
 		}
 	}
-	return nil
+
+	// Start the processes of the application
+	if err := p.Start(); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			p.Kill()
+		}
+	}()
+
+	// Monitor the context and Close the process when it is done.
+	go func() {
+		select {
+		case <-params.Ctx.Done():
+			p.Close()
+		case <-p.Done():
+		}
+	}()
+
+	// If this is a live reload, wait for the process to be ready.
+	// This way we ensure requests are always hitting a running server,
+	// in case a batch job or something is running.
+	if params.IsReload {
+		g, ctx := errgroup.WithContext(params.Ctx)
+		for _, gw := range p.Gateways {
+			gw := gw
+			g.Go(func() error {
+				gw.pollUntilProcessIsListening(ctx)
+				return nil
+			})
+		}
+		_ = g.Wait()
+	}
+
+	return p, nil
 }
 
 // logWriter is an io.Writer that buffers incoming logs
@@ -678,7 +694,7 @@ type logWriter struct {
 }
 
 func newLogWriter(run *Run, fn func(*Run, []byte)) *logWriter {
-	const maxLine = 10 * 1024
+	const maxLine = 100 * 1024
 	return &logWriter{
 		run:     run,
 		fn:      fn,
@@ -721,9 +737,9 @@ func (w *logWriter) Flush() {
 	}
 }
 
-// genID generates a random run/process id.
+// GenID generates a random run/process id.
 // It panics if it cannot get random bytes.
-func genID() string {
+func GenID() string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		panic("cannot generate random data: " + err.Error())
@@ -769,10 +785,44 @@ func usesSecrets(md *meta.Data) bool {
 }
 
 func genAuthKey() config.EncoreAuthKey {
-	kid := mathrand.Uint32()
+	// read a uint32 from crypto/rand to use as the key ID
+	var kidBytes [4]byte
+	if _, err := rand.Read(kidBytes[:]); err != nil {
+		panic("cannot generate random data: " + err.Error())
+	}
+	kid := binary.BigEndian.Uint32(kidBytes[:])
+
+	// kid := mathrand.Uint32()
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		panic("cannot generate random data: " + err.Error())
 	}
 	return config.EncoreAuthKey{KeyID: kid, Data: b[:]}
+}
+
+// CanDeleteNamespace implements namespace.DeletionHandler.
+func (m *Manager) CanDeleteNamespace(ctx context.Context, app *apps.Instance, ns *namespace.Namespace) error {
+	// Check if any of the active runs are using this namespace.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.runs {
+		if r.NS.ID == ns.ID && r.ctx.Err() == nil {
+			return errors.New("namespace is in use by 'encore run'")
+		}
+	}
+	return nil
+}
+
+// DeleteNamespace implements namespace.DeletionHandler.
+func (m *Manager) DeleteNamespace(ctx context.Context, app *apps.Instance, ns *namespace.Namespace) error {
+	// We don't need to do anything here; we only implement DeletionHandler for
+	// the CanDeleteNamespace check.
+	return nil
+}
+
+func isSingleProc(outputs []builder.BuildOutput) bool {
+	if len(outputs) != 1 {
+		return false
+	}
+	return len(outputs[0].GetEntrypoints()) == 1
 }

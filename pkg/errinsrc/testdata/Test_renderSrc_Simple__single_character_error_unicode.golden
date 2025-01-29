@@ -1,0 +1,18 @@
+
+── simple test error ──────────────────────────────────────────────────────────────────────[E0001]──
+
+There has been a simple error in your code
+
+   ╭─[ /test.cue:6:11 ]
+   │
+ 4 │ blah: {
+ 5 │     foo: bool
+ 6 │     bar: int | *3
+   ⋮              ▲
+   ⋮              ╰─ This looks dodgy
+ 7 │ }
+ 8 │ 
+───╯
+
+For more information please visit our great help documentation
+
